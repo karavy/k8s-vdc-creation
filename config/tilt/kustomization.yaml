@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../default
+  - ../debug-api
+  - apicall-smoke-test.yaml
+  - workflow-sequence.yaml
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: controller-manager
+      namespace: system
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: controller:tilt
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value:
+          - --leader-elect
+          - --health-probe-bind-address=:8081
+          - --apicall-allowed-origins=http://mock-api.apicall-debug.svc.cluster.local:8080
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: mock-api
+      namespace: apicall-debug
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: k8s-vdc-creation-mock-api:tilt

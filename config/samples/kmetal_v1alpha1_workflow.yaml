@@ -1,0 +1,32 @@
+apiVersion: kmetal.dinova.one/v1alpha1
+kind: Workflow
+metadata:
+  labels:
+    app.kubernetes.io/name: k8s-vdc-creation
+    app.kubernetes.io/managed-by: kustomize
+  name: workflow-sample
+spec:
+  # Steps reference existing ApiCallTemplate resources (see
+  # kmetal_v1alpha1_apicalltemplate.yaml). A template is never executed: the Workflow
+  # creates an owned ApiCall from it, and the ApiCall controller only runs ApiCalls
+  # that a Workflow owns.
+  steps:
+    - name: create-resource
+      api:
+        templateRef:
+          name: apicalltemplate-sample
+    # A step can publish named values from its response (outputs), and any later step can
+    # set them into its request body (inputs). Sensitive outputs go to a per-workflow
+    # Secret instead of the Workflow status.
+    #
+    # - name: login
+    #   api:
+    #     templateRef: {name: apicalltemplate-login}
+    #     outputs:
+    #       - {name: token, from: /token, sensitive: true}
+    #       - {name: region, from: /region, defaultJSON: '"eu-1"'}
+    # - name: create-resource
+    #   api:
+    #     templateRef: {name: apicalltemplate-sample}
+    #     inputs:
+    #       - {step: login, output: token, to: /auth/token}

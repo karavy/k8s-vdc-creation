@@ -1,0 +1,7 @@
+## Append samples of your project ##
+resources:
+- kmetal_v1alpha1_basecluster.yaml
+- kmetal_v1alpha1_apicall.yaml
+- kmetal_v1alpha1_workflow.yaml
+- kmetal_v1alpha1_apicalltemplate.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

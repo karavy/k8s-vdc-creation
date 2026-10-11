@@ -154,6 +154,9 @@ func validateReferences(steps []kmetalv1alpha1.WorkflowStep) error {
 			if err := check(i, step.Terraform.Inputs, false, nil); err != nil {
 				return err
 			}
+			if err := check(i, stateKeyReferences(step.Terraform.State.Key), false, nil); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -161,6 +164,9 @@ func validateReferences(steps []kmetalv1alpha1.WorkflowStep) error {
 
 // stepOutputs returns every output a step publishes: its own and its poll's.
 func stepOutputs(step kmetalv1alpha1.WorkflowStep) []kmetalv1alpha1.WorkflowOutput {
+	if step.Terraform != nil {
+		return slices.Clone(step.Terraform.Outputs)
+	}
 	if step.API == nil {
 		return nil
 	}
@@ -186,8 +192,10 @@ func outputSecretKey(step, output string) string { return step + "." + output }
 
 // captureOutputs extracts the declared outputs from response and records them:
 // non-sensitive values in the step status, sensitive ones in the workflow's Secret.
-// It is idempotent, so a retry after a partial failure rewrites the same values.
-func (r *Handler) captureOutputs(ctx context.Context, workflow *kmetalv1alpha1.Workflow, state *kmetalv1alpha1.WorkflowStepStatus, outputs []kmetalv1alpha1.WorkflowOutput, response []byte) error {
+// Outputs named in forceSensitive (for Terraform, those the module marked sensitive) are
+// kept in the Secret even when the step does not say so. It is idempotent, so a retry
+// after a partial failure rewrites the same values.
+func (r *Handler) captureOutputs(ctx context.Context, workflow *kmetalv1alpha1.Workflow, state *kmetalv1alpha1.WorkflowStepStatus, outputs []kmetalv1alpha1.WorkflowOutput, response []byte, forceSensitive ...string) error {
 	values, err := extractOutputs(response, outputs)
 	if err != nil || len(values) == 0 {
 		return err
@@ -197,7 +205,7 @@ func (r *Handler) captureOutputs(ctx context.Context, workflow *kmetalv1alpha1.W
 	}
 	secretData := map[string][]byte{}
 	for _, output := range outputs {
-		if output.Sensitive {
+		if output.Sensitive || slices.Contains(forceSensitive, output.Name) {
 			secretData[outputSecretKey(state.Name, output.Name)] = values[output.Name]
 			if !slices.Contains(state.SensitiveOutputs, output.Name) {
 				state.SensitiveOutputs = append(state.SensitiveOutputs, output.Name)

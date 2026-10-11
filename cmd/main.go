@@ -45,6 +45,7 @@ import (
 	kmetalv1alpha1 "github.com/karavy/k8s-vdc-creation/api/v1alpha1"
 	"github.com/karavy/k8s-vdc-creation/internal/controller"
 	"github.com/karavy/k8s-vdc-creation/internal/controller/apicall"
+	"github.com/karavy/k8s-vdc-creation/internal/controller/terraform"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -70,9 +71,16 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var apiAllowedOrigins string
+	var tfStateEndpoint, tfStateBucket, tfStateRegion string
 	var apiCAFile string
 	var apiWorkers, apiQueueSize int
 	var tlsOpts []func(*tls.Config)
+	flag.StringVar(&tfStateEndpoint, "tfstate-s3-endpoint", "",
+		"URL of the S3-compatible storage that holds every Terraform state, for example http://minio.storage:9000. "+
+			"Credentials come from TFSTATE_S3_ACCESS_KEY_ID and TFSTATE_S3_SECRET_ACCESS_KEY.")
+	flag.StringVar(&tfStateBucket, "tfstate-s3-bucket", "", "Bucket of the Terraform state storage.")
+	flag.StringVar(&tfStateRegion, "tfstate-s3-region", "us-east-1",
+		"Region of the Terraform state storage (often arbitrary on-premises).")
 	flag.StringVar(&apiAllowedOrigins, "apicall-allowed-origins", "",
 		"Comma-separated HTTP(S) origins allowed for ApiCall; empty denies all destinations.")
 	flag.StringVar(&apiCAFile, "apicall-ca-file", "",
@@ -241,9 +249,18 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "apicall")
 		os.Exit(1)
 	}
+	stateConfig, err := terraform.NewS3StateConfig(tfStateEndpoint, tfStateBucket, tfStateRegion,
+		os.Getenv("TFSTATE_S3_ACCESS_KEY_ID"), os.Getenv("TFSTATE_S3_SECRET_ACCESS_KEY"))
+	if err != nil {
+		setupLog.Error(err, "Invalid Terraform state storage configuration")
+		os.Exit(1)
+	}
+	if !stateConfig.Configured() {
+		setupLog.Info("No Terraform state storage configured; Terraform steps fail until --tfstate-s3-* are set")
+	}
 	if err := (&controller.WorkflowReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
-		TerraformRunnerImage: controller.TerraformRunnerImage(),
+		TerraformRunnerImage: controller.TerraformRunnerImage(), TerraformState: stateConfig,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "workflow")
 		os.Exit(1)

@@ -5,6 +5,8 @@ resources:
   - ../debug-api
   - apicall-smoke-test.yaml
   - workflow-sequence.yaml
+  - tfstate-storage.yaml
+  - workflow-terraform.yaml
 patches:
   - target:
       group: apps
@@ -22,6 +24,20 @@ patches:
           - --leader-elect
           - --health-probe-bind-address=:8081
           - --apicall-allowed-origins=http://mock-api.apicall-debug.svc.cluster.local:8080
+          - --tfstate-s3-endpoint=http://minio.tfstate-storage.svc.cluster.local:9000
+          - --tfstate-s3-bucket=tfstate
+          - --tfstate-s3-region=us-east-1
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: TERRAFORM_RUNNER_IMAGE
+            value: k8s-vdc-creation-terraform-runner:tilt
+          - name: TFSTATE_S3_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef: {name: tfstate-operator-credentials, key: TFSTATE_S3_ACCESS_KEY_ID}
+          - name: TFSTATE_S3_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef: {name: tfstate-operator-credentials, key: TFSTATE_S3_SECRET_ACCESS_KEY}
   - target:
       group: apps
       version: v1

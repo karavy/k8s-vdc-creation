@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the k8s-vdc-creation itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- terraformtemplate_admin_role.yaml
+- terraformtemplate_editor_role.yaml
+- terraformtemplate_viewer_role.yaml
 - apicalltemplate_admin_role.yaml
 - apicalltemplate_editor_role.yaml
 - apicalltemplate_viewer_role.yaml

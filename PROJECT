@@ -44,4 +44,12 @@ resources:
   kind: ApiCallTemplate
   path: github.com/karavy/k8s-vdc-creation/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: dinova.one
+  group: kmetal
+  kind: TerraformTemplate
+  path: github.com/karavy/k8s-vdc-creation/api/v1alpha1
+  version: v1alpha1
 version: "3"

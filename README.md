@@ -64,6 +64,77 @@ pronto" e consuma un tentativo; richieste non valide, risposte troppo grandi ed
 esecuzioni perse non sono mai tollerate, e le opzioni non valgono per la chiamata
 iniziale.
 
+### Step Terraform
+
+Come per le chiamate API, la definizione è separata dal workflow: un
+[TerraformTemplate](api/v1alpha1/terraformtemplate_types.go) contiene l'elenco dei file
+(`spec.files`: `name` + `content`, nome senza directory e con estensione `.tf` o
+`.tf.tmpl`) e lo step lo richiama con `terraform.templateRef`. Come l'ApiCallTemplate, non
+ha controller né status e non viene mai eseguito da solo.
+
+All'avvio dello step il Workflow **copia** i file in una ConfigMap di cui è owner (le
+modifiche successive al template non cambiano uno step già partito) e crea un Job che monta
+la ConfigMap, il PVC del workflow (solo file di lavoro: template renderizzati e provider) e un
+Secret con `terraform.auto.tfvars.json`, costruito dagli `inputs` dello step. Render dei
+`*.tf.tmpl` (placeholder `<FGT_NOME>` e cicli `<FGT_FOR_STR>`), `init` e `apply` li fa
+[terraform-engine](../terraform-engine) dentro il Job ([cmd/terraform-runner](cmd/terraform-runner));
+la logica Kubernetes (file, Job, storage dello state) sta in
+[internal/controller/terraform](internal/controller/terraform). Esempio in
+[config/samples/kmetal_v1alpha1_terraformtemplate.yaml](config/samples/kmetal_v1alpha1_terraformtemplate.yaml).
+Un workflow può avere più step Terraform: ognuno lavora nella propria cartella
+`/workspace/<nome-step>` del PVC (i job girano in sequenza, quindi il volume ReadWriteOnce
+condiviso basta).
+
+#### State condiviso tra workflow
+
+Lo state **non** sta nel workflow né nel PVC: è un oggetto in uno storage S3 compatibile
+(MinIO, Garage, Ceph RGW...) identificato da `terraform.state.key`. Workflow diversi, anche
+a distanza di tempo e con valori modificati, che usano la stessa chiave nello stesso
+namespace lavorano **sullo stesso state**: Terraform confronta i nuovi valori con lo stato
+esistente e modifica la risorsa invece di ricrearla. Se un `apply` si interrompe, la
+risorsa è già in parte nello state e l'esecuzione successiva riparte da lì.
+
+```yaml
+- name: network
+  terraform:
+    templateRef: {name: network}
+    state:
+      key: vdc/{{steps.create-vdc.outputs.vdcName}}/network   # la risorsa "rete del VDC acme"
+    envFromSecrets: [tfstate-credentials]                     # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    inputs:
+      - {step: create-vdc, output: vdcId, to: /vdc_id}
+    outputs:
+      - {name: networkId, from: /network_id}
+```
+
+- **Chiave:** segmenti separati da `/` con lettere, cifre, `.`, `_`, `-` (se inizia con `{{` in YAML
+  servono le virgolette). Può contenere
+  `{{steps.<step>.outputs.<nome>}}`, sostituito con un output di uno step precedente (anche
+  Terraform): deve essere stringa, numero o booleano fatto degli stessi caratteri, così un
+  valore non può mai aggiungere segmenti né uscire dal percorso. L'oggetto nello storage è
+  `<namespace>/<chiave>.tfstate`, quindi due namespace non condividono mai uno state.
+- **Il backend lo scrive il runner**, in un file `backend_override.tf` che prevale su qualunque
+  `backend` scritto nel template: non si può dimenticare né aggirare, e senza configurazione
+  completa il Job fallisce invece di usare uno state locale che si perderebbe. Il lock dello
+  state è un file nel bucket (`use_lockfile`: richiede OpenTofu ≥ 1.10 e uno storage con
+  scritture condizionali): due esecuzioni sulla stessa chiave non si sovrappongono, la seconda
+  fallisce con "Error acquiring the state lock".
+- **Configurazione dell'operator:** `--tfstate-s3-endpoint`, `--tfstate-s3-bucket`,
+  `--tfstate-s3-region` (default `us-east-1`) e le variabili d'ambiente
+  `TFSTATE_S3_ACCESS_KEY_ID` / `TFSTATE_S3_SECRET_ACCESS_KEY`, con cui l'operator **legge** lo
+  state per pubblicare gli output. Senza questi parametri gli step Terraform falliscono con
+  `StateBackendNotConfigured`; una configurazione parziale impedisce l'avvio.
+- **Credenziali del Job:** vengono da un Secret del namespace elencato in `envFromSecrets`, con
+  `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY` (il Job non ha accesso all'API Kubernetes).
+- **Output:** `terraform.outputs` legge i valori dallo state quando il Job riesce, come un
+  unico oggetto JSON `{"nome_output": valore}`: `from` è un JSON Pointer (`/network_id`,
+  `/ips/0`) e valgono `defaultJSON`/`sensitive` come per gli step API. Un output marcato
+  `sensitive = true` in Terraform va **sempre** nel Secret, anche se nello step non lo si
+  dichiara. Se non si dichiarano output lo state non viene nemmeno letto.
+- **Limiti:** lo state in chiaro contiene anche i valori sensibili, quindi il bucket va
+  protetto come un Secret; non c'è ancora un modo per distruggere le risorse (`destroy`) o per
+  cancellare uno state.
+
 ### Passare dati da uno step all'altro
 
 Uno step pubblica valori **con nome** dalla propria risposta JSON (`outputs`) e
@@ -100,7 +171,8 @@ steps:
   `poll.outputs` legge la risposta **finale** (quella che soddisfa la condizione), e
   `poll.inputs` può usare gli output dello step e di quelli precedenti.
 - Lo step Terraform usa `inputs` allo stesso modo: `to` è il nome della variabile
-  (`/cluster_id`) nel `terraform.auto.tfvars.json`.
+  (`/cluster_id`) nel `terraform.auto.tfvars.json`. Gli output di Terraform si pubblicano
+  con `outputs` (vedi "State condiviso tra workflow").
 - I valori si inseriscono solo nel **body JSON** (non in URL, query o header).
 
 **Limite sui dati sensibili:** il Secret protegge lo status del Workflow e permette
@@ -392,6 +464,25 @@ kubectl get workflow tilt-mock-echo-run -o yaml
 kubectl get apicall -l kmetal.dinova.one/workflow=tilt-mock-echo-run -o yaml
 kubectl logs -n apicall-debug deployment/mock-api
 ```
+
+Lo stack include anche tutto il necessario per gli step Terraform
+([config/tilt/tfstate-storage.yaml](config/tilt/tfstate-storage.yaml)): un **MinIO** nel
+namespace `tfstate-storage` con il bucket `tfstate` (console su `localhost:9001`, S3 su
+`localhost:9000`), i flag `--tfstate-s3-*` e le credenziali di sviluppo dell'operator, il Secret
+`tfstate-credentials` per i Job e l'immagine del runner, costruita e caricata nel Kind dal
+Tiltfile. Il Kind non riesce a scaricare l'immagine di MinIO (il registry risponde 401) né
+`kind load` riesce a caricarla perché è multi-piattaforma, quindi il Tiltfile la importa dal
+Docker locale con `docker save | ctr images import`. Il workflow `tilt-api-then-terraform`
+([workflow-terraform.yaml](config/tilt/workflow-terraform.yaml)) legge una chiamata API e ne usa il
+risultato per avviare Terraform: lanciandone un altro con lo stesso nome del VDC si vede la
+risorsa modificata sullo stesso state (`will be updated in-place`):
+
+```sh
+kubectl get workflow tilt-api-then-terraform -o yaml
+kubectl logs job/<job-del-workflow>
+```
+
+Queste credenziali e lo storage (emptyDir) sono **solo per sviluppo**.
 
 Il Workflow `tilt-vdc-network` ([workflow-sequence.yaml](config/tilt/workflow-sequence.yaml))
 esegue in sequenza due ApiCallTemplate distinti: `POST /vdcs` crea un VDC e restituisce

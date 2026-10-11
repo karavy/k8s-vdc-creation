@@ -22,14 +22,14 @@ import (
 
 // WorkflowSpec describes an immutable ordered sequence of API and Terraform steps.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Workflow spec is immutable; create a new workflow to change its steps"
-// +kubebuilder:validation:XValidation:rule="self.steps.filter(s, has(s.terraform)).size() <= 1",message="at most one Terraform step is supported per workflow"
 type WorkflowSpec struct {
 	// Steps run strictly in order. A step starts only after its predecessor succeeds.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=20
 	// +listType=atomic
 	Steps []WorkflowStep `json:"steps"`
-	// WorkspaceStorage requests a per-workflow PVC for Terraform state and working files.
+	// WorkspaceStorage requests a per-workflow PVC for the Terraform working files (rendered
+	// templates, providers). Terraform state does not live here: see WorkflowTerraformState.
 	// +kubebuilder:default="2Gi"
 	// +kubebuilder:validation:Pattern=`^[1-9][0-9]*(Mi|Gi|Ti)$`
 	// +optional
@@ -128,6 +128,22 @@ type WorkflowPoll struct {
 	RetryOnTransportErrors bool `json:"retryOnTransportErrors,omitempty"`
 }
 
+// WorkflowTerraformState identifies the Terraform state of a step.
+type WorkflowTerraformState struct {
+	// Key names the resource this step manages, for example "vdc/acme/network". Workflows
+	// that use the same key in the same namespace share one state, even at different times,
+	// so a later run with changed inputs modifies the existing resources. Concurrent runs on
+	// the same key do not overlap: the second one fails on the state lock.
+	//
+	// Segments are separated by "/" and use letters, digits, ".", "_" and "-". A segment can
+	// contain placeholders {{steps.<step>.outputs.<name>}} that are replaced by the output of
+	// an earlier step, which must be a string, number or boolean made of the same characters.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._{}/ -]+$`
+	Key string `json:"key"`
+}
+
 // WorkflowOutput publishes one named value from a JSON response so that later steps
 // can use it, instead of depending on the shape of the previous response.
 type WorkflowOutput struct {
@@ -166,19 +182,31 @@ type WorkflowInput struct {
 	To string `json:"to"`
 }
 
-// WorkflowTerraformStep provisions infrastructure in the workflow's persistent workspace.
+// WorkflowTerraformStep provisions infrastructure with terraform-engine. Its state is kept
+// in S3-compatible storage under State.Key, independently of the workflow: any later
+// workflow that uses the same key works on the same state and so on the same resources.
+// Every Terraform step works in its own folder of the workflow's workspace, named after
+// the step, so a workflow can have any number of them.
 type WorkflowTerraformStep struct {
-	// TemplateConfigMap contains Terraform files; *.tf.tmpl files are rendered with values.
-	// It must be in the Workflow's namespace.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	TemplateConfigMap string `json:"templateConfigMap"`
+	// TemplateRef names the TerraformTemplate whose files this step runs. Its files are
+	// copied when the step starts; later edits of the template do not affect it.
+	TemplateRef WorkflowResourceReference `json:"templateRef"`
 	// Inputs set values published by earlier steps into terraform.auto.tfvars.json;
 	// To is a JSON pointer such as /cluster_id naming the Terraform variable.
 	// +kubebuilder:validation:MaxItems=32
 	// +listType=atomic
 	// +optional
 	Inputs []WorkflowInput `json:"inputs,omitempty"`
+	// State says where the Terraform state of this step lives.
+	State WorkflowTerraformState `json:"state"`
+	// Outputs publish values from the Terraform outputs (the "output" blocks of the
+	// template) for later steps. They are read from the state once the Job succeeds,
+	// as one JSON object {"<output name>": value}, so From is a JSON Pointer such as
+	// /vpc_id or /ips/0. Terraform outputs marked sensitive are always kept in the Secret.
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=atomic
+	// +optional
+	Outputs []WorkflowOutput `json:"outputs,omitempty"`
 	// Maximum wall time for the Terraform Job.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=7200
@@ -186,6 +214,7 @@ type WorkflowTerraformStep struct {
 	// +optional
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 	// Secret names in the workflow namespace whose keys are exposed as environment variables to the Terraform Job.
+	// The storage credentials (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) must come from one of them.
 	// +kubebuilder:validation:MaxItems=8
 	// +optional
 	EnvFromSecrets []string `json:"envFromSecrets,omitempty"`
@@ -209,6 +238,9 @@ type WorkflowStepStatus struct {
 	// +kubebuilder:validation:MaxProperties=32
 	// +optional
 	Outputs map[string]string `json:"outputs,omitempty"`
+	// StateKey is the object key of the step's Terraform state in the state storage.
+	// +optional
+	StateKey string `json:"stateKey,omitempty"`
 	// SensitiveOutputs lists the output names whose values live in the workflow's
 	// outputs Secret, under the key "<step>.<output>". Values are never shown here.
 	// +kubebuilder:validation:MaxItems=32

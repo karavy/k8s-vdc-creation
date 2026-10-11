@@ -66,8 +66,7 @@ func run() error {
 			}
 		}
 	}
-	mainFile, err := findTerraformFile(workspace)
-	if err != nil {
+	if _, err := findTerraformFile(workspace); err != nil {
 		return err
 	}
 	variablesBytes, err = json.Marshal(variables)
@@ -77,21 +76,27 @@ func run() error {
 	if err := os.WriteFile(filepath.Join(workspace, "terraform.auto.tfvars.json"), variablesBytes, 0o600); err != nil {
 		return fmt.Errorf("write Terraform variable file: %w", err)
 	}
+	// The state lives in S3-compatible storage under a stable key, never in the workspace,
+	// so a later run, possibly of another workflow, continues from it. The backend is an
+	// override file: it wins over any backend the template declares. Without a complete
+	// configuration the run must fail rather than fall back to a local state that is lost.
+	backend := tfengine.S3Backend{
+		Endpoint: os.Getenv("TF_STATE_ENDPOINT"), Bucket: os.Getenv("TF_STATE_BUCKET"),
+		Region: os.Getenv("TF_STATE_REGION"), Key: os.Getenv("TF_STATE_KEY"),
+	}
+	if _, err := tfengine.WriteS3BackendOverride(workspace, backend); err != nil {
+		return fmt.Errorf("configure the Terraform state backend: %w", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	terraform, err := tfengine.CreateTerraform(workspace)
 	if err != nil {
 		return fmt.Errorf("initialize OpenTofu: %w", err)
 	}
-	lockFile := filepath.Join(workspace, ".terraform.lock.hcl")
-	needsInit, err := tfengine.NeedsInit(mainFile, lockFile)
-	if err != nil {
-		return fmt.Errorf("check provider lock: %w", err)
-	}
-	if needsInit {
-		if err := tfengine.RunInit(terraform, ctx); err != nil {
-			return fmt.Errorf("OpenTofu init failed: %w", err)
-		}
+	// The backend is rewritten on every run, so init always runs; it is cheap once the
+	// providers are cached in the workspace.
+	if err := tfengine.RunInit(terraform, ctx); err != nil {
+		return fmt.Errorf("OpenTofu init failed: %w", err)
 	}
 	if err := tfengine.RunApply(terraform, ctx); err != nil {
 		return fmt.Errorf("OpenTofu plan/apply failed: %w", err)

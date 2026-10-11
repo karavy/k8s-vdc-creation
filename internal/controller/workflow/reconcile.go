@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kmetalv1alpha1 "github.com/karavy/k8s-vdc-creation/api/v1alpha1"
+	"github.com/karavy/k8s-vdc-creation/internal/controller/terraform"
 )
 
 const (
@@ -40,7 +41,6 @@ const (
 	stepPhaseFailed        = "Failed"
 	stepPhaseUnknown       = "Unknown"
 	workflowPollInterval   = 2 * time.Second
-	terraformVarsKey       = "terraform.auto.tfvars.json"
 )
 
 var errTemplateUnavailable = errors.New("referenced ApiCallTemplate was not found")
@@ -54,6 +54,8 @@ type Handler struct {
 	TerraformRunnerImage string
 	// APIReader reads Secrets and ConfigMaps without a cluster-wide cache; Client is used when nil.
 	APIReader client.Reader
+	// TerraformState is the storage of every Terraform state; Terraform steps need it.
+	TerraformState terraform.StateConfig
 }
 
 func (r *Handler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -311,20 +313,44 @@ func (r *Handler) reconcileTerraformStep(ctx context.Context, workflow *kmetalv1
 		if err != nil {
 			return r.failWorkflow(ctx, workflow, state, "WorkspaceFailed", "Could not create Terraform workspace PVC")
 		}
-		if workspace.Status.Phase != corev1.ClaimBound {
-			state.Message = "Waiting for the Terraform workspace PVC to bind"
-			workflow.Status.Phase = workflowPhaseRunning
-			if err := r.Status().Update(ctx, workflow); err != nil {
-				return ctrl.Result{}, err
+		// The Job is created even if the claim is still Pending: storage classes with
+		// WaitForFirstConsumer (Kind's default) bind a volume only once a pod uses it, so
+		// waiting for Bound here would wait forever. The Job's deadline bounds a claim that
+		// never binds.
+		if !r.TerraformState.Configured() {
+			return r.failWorkflow(ctx, workflow, state, "StateBackendNotConfigured", "The operator has no Terraform state storage configured (--tfstate-s3-* flags)")
+		}
+		stateKey, err := renderStateKey(tf.State.Key, r.outputResolver(ctx, workflow))
+		if err != nil {
+			return r.failWorkflow(ctx, workflow, state, "StateKeyInvalid", err.Error())
+		}
+		backend := r.TerraformState.Backend(terraform.ObjectKey(workflow.Namespace, stateKey))
+		if err := backend.Validate(); err != nil {
+			return r.failWorkflow(ctx, workflow, state, "StateKeyInvalid", err.Error())
+		}
+		state.StateKey = backend.Key
+		template := &kmetalv1alpha1.TerraformTemplate{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: workflow.Namespace, Name: tf.TemplateRef.Name}, template); err != nil {
+			if apierrors.IsNotFound(err) {
+				return r.failWorkflow(ctx, workflow, state, "TerraformTemplateUnavailable", fmt.Sprintf("Referenced TerraformTemplate %q was not found", tf.TemplateRef.Name))
 			}
-			return ctrl.Result{RequeueAfter: workflowPollInterval}, nil
+			return ctrl.Result{}, err
 		}
-		templateConfigMap := &corev1.ConfigMap{}
-		if err := r.reader().Get(ctx, types.NamespacedName{Namespace: workflow.Namespace, Name: tf.TemplateConfigMap}, templateConfigMap); err != nil {
-			return r.failWorkflow(ctx, workflow, state, "TemplateConfigMapUnavailable", "Terraform template ConfigMap was not found")
+		files, err := terraform.ConfigMapData(template)
+		if err != nil {
+			return r.failWorkflow(ctx, workflow, state, "TerraformTemplateInvalid", err.Error())
 		}
-		if len(templateConfigMap.Data)+len(templateConfigMap.BinaryData) == 0 {
-			return r.failWorkflow(ctx, workflow, state, "TemplateConfigMapEmpty", "Terraform template ConfigMap has no files")
+		// The files are copied now, so later edits of the template never change a running step.
+		templateFiles := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: workflow.Namespace, Name: workflowChildName(workflow, step.Name, "tf-template"),
+				Labels:      map[string]string{"kmetal.dinova.one/workflow": workflow.Name},
+				Annotations: map[string]string{"kmetal.dinova.one/terraform-template": tf.TemplateRef.Name},
+			},
+			Data: files,
+		}
+		if err := r.createOwned(ctx, workflow, templateFiles); err != nil {
+			return ctrl.Result{}, err
 		}
 		variables, err := applyInputs([]byte(`{}`), tf.Inputs, r.outputResolver(ctx, workflow))
 		if err != nil {
@@ -336,7 +362,7 @@ func (r *Handler) reconcileTerraformStep(ctx context.Context, workflow *kmetalv1
 				Labels: map[string]string{"kmetal.dinova.one/workflow": workflow.Name},
 			},
 			Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{terraformVarsKey: variables},
+			Data: map[string][]byte{terraform.VariablesKey: variables},
 		}
 		if err := controllerutil.SetControllerReference(workflow, inputSecret, r.Scheme); err != nil {
 			return ctrl.Result{}, err
@@ -344,7 +370,13 @@ func (r *Handler) reconcileTerraformStep(ctx context.Context, workflow *kmetalv1
 		if err := r.createOwned(ctx, workflow, inputSecret); err != nil {
 			return ctrl.Result{}, err
 		}
-		job, err := r.newTerraformJob(workflow, step, workspace.Name, inputSecret.Name)
+		job, err := terraform.NewJob(terraform.JobConfig{
+			Namespace: workflow.Namespace, Name: workflowChildName(workflow, step.Name, "terraform"), StepName: step.Name,
+			RunnerImage: r.TerraformRunnerImage, WorkspacePVC: workspace.Name,
+			TemplateConfigMap: templateFiles.Name, InputSecret: inputSecret.Name,
+			TimeoutSeconds: tf.TimeoutSeconds, EnvFromSecrets: tf.EnvFromSecrets, State: backend,
+			Labels: map[string]string{"kmetal.dinova.one/workflow": workflow.Name},
+		})
 		if err != nil {
 			return r.failWorkflow(ctx, workflow, state, "TerraformJobInvalid", "Could not prepare Terraform Job")
 		}
@@ -364,6 +396,9 @@ func (r *Handler) reconcileTerraformStep(ctx context.Context, workflow *kmetalv1
 		return ctrl.Result{}, err
 	}
 	if job.Status.Succeeded > 0 {
+		if err := r.captureTerraformOutputs(ctx, workflow, state, tf); err != nil {
+			return r.outputError(ctx, workflow, state, err)
+		}
 		state.Phase = stepPhaseSucceeded
 		state.Message = "Terraform apply completed"
 		workflow.Status.CurrentStep++
@@ -373,6 +408,40 @@ func (r *Handler) reconcileTerraformStep(ctx context.Context, workflow *kmetalv1
 		return r.failWorkflow(ctx, workflow, state, "TerraformJobFailed", "Terraform Job failed; inspect its pod logs")
 	}
 	return ctrl.Result{RequeueAfter: workflowPollInterval}, nil
+}
+
+// captureTerraformOutputs publishes the step's declared outputs from the Terraform state
+// the Job has just written. Without declared outputs the state is not even read.
+func (r *Handler) captureTerraformOutputs(ctx context.Context, workflow *kmetalv1alpha1.Workflow, state *kmetalv1alpha1.WorkflowStepStatus, tf *kmetalv1alpha1.WorkflowTerraformStep) error {
+	if len(tf.Outputs) == 0 {
+		return nil
+	}
+	raw, err := r.TerraformState.Reader.Read(ctx, state.StateKey)
+	switch {
+	case errors.Is(err, terraform.ErrStateNotFound):
+		return &outputFailure{"StateNotFound", "The Terraform state was not found after the Job succeeded"}
+	case err != nil:
+		return err // transient: the reconciler retries
+	}
+	document, sensitive, err := terraform.StateOutputs(raw)
+	if err != nil {
+		return &outputFailure{"StateInvalid", "The Terraform state could not be read for its outputs"}
+	}
+	return r.captureOutputs(ctx, workflow, state, tf.Outputs, document, sensitiveDeclared(tf.Outputs, sensitive)...)
+}
+
+// sensitiveDeclared returns the names of the declared outputs that read from a Terraform
+// output marked sensitive. An output reads from the Terraform output named by the first
+// segment of its pointer, so "/db/password" is sensitive when the "db" output is.
+func sensitiveDeclared(declared []kmetalv1alpha1.WorkflowOutput, sensitiveTerraformOutputs []string) []string {
+	var names []string
+	for _, output := range declared {
+		segments, err := pointerSegments(output.From)
+		if err == nil && len(segments) > 0 && slices.Contains(sensitiveTerraformOutputs, segments[0]) {
+			names = append(names, output.Name)
+		}
+	}
+	return names
 }
 
 func (r *Handler) ensureWorkspacePVC(ctx context.Context, workflow *kmetalv1alpha1.Workflow) (*corev1.PersistentVolumeClaim, error) {
@@ -409,62 +478,6 @@ func (r *Handler) ensureWorkspacePVC(ctx context.Context, workflow *kmetalv1alph
 	}
 	workflow.Status.WorkspacePVCName = name
 	return pvc, nil
-}
-
-func (r *Handler) newTerraformJob(workflow *kmetalv1alpha1.Workflow, step kmetalv1alpha1.WorkflowStep, pvcName, inputSecretName string) (*batchv1.Job, error) {
-	if r.TerraformRunnerImage == "" {
-		return nil, errors.New("runner image for Terraform is not configured")
-	}
-	tf := step.Terraform
-	timeout := tf.TimeoutSeconds
-	if timeout == 0 {
-		timeout = 1800
-	}
-	deadline := int64(timeout)
-	backoff := int32(0)
-	fsGroup := int64(65532)
-	container := corev1.Container{
-		Name: "terraform", Image: r.TerraformRunnerImage, ImagePullPolicy: corev1.PullIfNotPresent,
-		Env: []corev1.EnvVar{
-			{Name: "WORKSPACE_DIR", Value: "/workspace"},
-			{Name: "TEMPLATE_DIR", Value: "/templates"},
-			{Name: "VARIABLES_FILE", Value: "/input/" + terraformVarsKey},
-			{Name: "TF_IN_AUTOMATION", Value: "true"},
-		},
-		EnvFrom: []corev1.EnvFromSource{},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "workspace", MountPath: "/workspace"},
-			{Name: "templates", MountPath: "/templates", ReadOnly: true},
-			{Name: "input", MountPath: "/input", ReadOnly: true},
-			{Name: "tmp", MountPath: "/tmp"},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: new(false), ReadOnlyRootFilesystem: new(true),
-			Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		},
-	}
-	for _, secretName := range tf.EnvFromSecrets {
-		container.EnvFrom = append(container.EnvFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}}})
-	}
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Namespace: workflow.Namespace, Name: workflowChildName(workflow, step.Name, "terraform")},
-		Spec: batchv1.JobSpec{
-			BackoffLimit: &backoff, ActiveDeadlineSeconds: &deadline, TTLSecondsAfterFinished: new(int32(86400)),
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(false),
-					SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: new(true), RunAsUser: new(int64(65532)), RunAsGroup: new(int64(65532)), FSGroup: &fsGroup, SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
-					Containers:      []corev1.Container{container},
-					Volumes: []corev1.Volume{
-						{Name: "workspace", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName}}},
-						{Name: "templates", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: tf.TemplateConfigMap}}}},
-						{Name: "input", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: inputSecretName}}},
-						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-					},
-				},
-			},
-		},
-	}, nil
 }
 
 func pollCondition(response []byte, poll *kmetalv1alpha1.WorkflowPoll) (bool, error) {

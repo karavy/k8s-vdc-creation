@@ -4,4 +4,5 @@ resources:
 - kmetal_v1alpha1_apicall.yaml
 - kmetal_v1alpha1_workflow.yaml
 - kmetal_v1alpha1_apicalltemplate.yaml
+- kmetal_v1alpha1_terraformtemplate.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

@@ -166,3 +166,53 @@ func TestValidateReferences(t *testing.T) {
 		}
 	}
 }
+
+func terraformStep(name, key string, inputs []input, outputs ...output) kmetalv1alpha1.WorkflowStep {
+	return kmetalv1alpha1.WorkflowStep{Name: name, Terraform: &kmetalv1alpha1.WorkflowTerraformStep{
+		State: kmetalv1alpha1.WorkflowTerraformState{Key: key}, Inputs: inputs, Outputs: outputs,
+	}}
+}
+
+func TestValidateReferencesCoversTerraformStateKeysAndOutputs(t *testing.T) {
+	create := apiStep("create-vdc", output{Name: "name", From: "/name"})
+	net := terraformStep("net", "vdc/{{steps.create-vdc.outputs.name}}/net", nil, output{Name: "network_id", From: "/network_id"})
+	for i, steps := range [][]kmetalv1alpha1.WorkflowStep{
+		{create, net},
+		// a Terraform step may use the outputs of an earlier Terraform step, as variables and in its key
+		{create, net, terraformStep("cluster", "vdc/{{steps.create-vdc.outputs.name}}/{{steps.net.outputs.network_id}}",
+			[]input{{Step: "net", Output: "network_id", To: "/network_id"}})},
+		{terraformStep("solo", "static/key", nil)},
+	} {
+		if err := validateReferences(steps); err != nil {
+			t.Errorf("valid case %d rejected: %v", i, err)
+		}
+	}
+	for name, steps := range map[string][]kmetalv1alpha1.WorkflowStep{
+		"key uses an unknown step":                  {create, terraformStep("net", "vdc/{{steps.ghost.outputs.name}}", nil)},
+		"key uses an undeclared value":              {create, terraformStep("net", "vdc/{{steps.create-vdc.outputs.nope}}", nil)},
+		"key uses a later step":                     {terraformStep("net", "vdc/{{steps.create-vdc.outputs.name}}", nil), create},
+		"key uses its own output":                   {terraformStep("net", "vdc/{{steps.net.outputs.id}}", nil, output{Name: "id", From: "/id"})},
+		"input from an undeclared terraform output": {net, terraformStep("cluster", "k", []input{{Step: "net", Output: "nope", To: "/x"}})},
+		"terraform declares a duplicate output":     {terraformStep("net", "k", nil, output{Name: "a", From: "/a"}, output{Name: "a", From: "/b"})},
+	} {
+		if err := validateReferences(steps); err == nil {
+			t.Errorf("%s: expected a validation error", name)
+		}
+	}
+}
+
+func TestSensitiveDeclaredFollowsTheTerraformOutputThePointerReadsFrom(t *testing.T) {
+	declared := []output{
+		{Name: "adminPassword", From: "/admin_password"}, // the name differs from the Terraform output
+		{Name: "dbPassword", From: "/db/password"},       // a field of a sensitive object output
+		{Name: "networkId", From: "/network_id"},
+		{Name: "firstIP", From: "/ips/0"},
+	}
+	got := sensitiveDeclared(declared, []string{"admin_password", "db"})
+	if len(got) != 2 || got[0] != "adminPassword" || got[1] != "dbPassword" {
+		t.Fatalf("sensitive declared outputs = %v, want [adminPassword dbPassword]", got)
+	}
+	if got := sensitiveDeclared(declared, nil); len(got) != 0 {
+		t.Fatalf("nothing is sensitive: %v", got)
+	}
+}

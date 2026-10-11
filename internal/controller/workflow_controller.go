@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kmetalv1alpha1 "github.com/karavy/k8s-vdc-creation/api/v1alpha1"
+	"github.com/karavy/k8s-vdc-creation/internal/controller/terraform"
 	"github.com/karavy/k8s-vdc-creation/internal/controller/workflow"
 )
 
@@ -36,6 +37,7 @@ type WorkflowReconciler struct {
 	Scheme               *runtime.Scheme
 	TerraformRunnerImage string
 	APIReader            client.Reader
+	TerraformState       terraform.StateConfig
 }
 
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=workflows,verbs=get;list;watch;create;update;patch;delete
@@ -45,7 +47,8 @@ type WorkflowReconciler struct {
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=apicalltemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create
+// +kubebuilder:rbac:groups=kmetal.dinova.one,resources=terraformtemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -59,7 +62,7 @@ type WorkflowReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
 func (r *WorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	helper := &workflow.Handler{
-		Client: r.Client, Scheme: r.Scheme, TerraformRunnerImage: r.TerraformRunnerImage, APIReader: r.APIReader,
+		Client: r.Client, Scheme: r.Scheme, TerraformRunnerImage: r.TerraformRunnerImage, APIReader: r.APIReader, TerraformState: r.TerraformState,
 	}
 	return helper.Reconcile(ctx, req)
 }

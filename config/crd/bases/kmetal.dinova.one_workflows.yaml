@@ -286,13 +286,17 @@ spec:
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     terraform:
-                      description: WorkflowTerraformStep provisions infrastructure
-                        in the workflow's persistent workspace.
+                      description: |-
+                        WorkflowTerraformStep provisions infrastructure with terraform-engine. Its state is kept
+                        in S3-compatible storage under State.Key, independently of the workflow: any later
+                        workflow that uses the same key works on the same state and so on the same resources.
+                        Every Terraform step works in its own folder of the workflow's workspace, named after
+                        the step, so a workflow can have any number of them.
                       properties:
                         envFromSecrets:
-                          description: Secret names in the workflow namespace whose
-                            keys are exposed as environment variables to the Terraform
-                            Job.
+                          description: |-
+                            Secret names in the workflow namespace whose keys are exposed as environment variables to the Terraform Job.
+                            The storage credentials (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) must come from one of them.
                           items:
                             type: string
                           maxItems: 8
@@ -332,13 +336,79 @@ spec:
                           maxItems: 32
                           type: array
                           x-kubernetes-list-type: atomic
-                        templateConfigMap:
+                        outputs:
                           description: |-
-                            TemplateConfigMap contains Terraform files; *.tf.tmpl files are rendered with values.
-                            It must be in the Workflow's namespace.
-                          maxLength: 253
-                          minLength: 1
-                          type: string
+                            Outputs publish values from the Terraform outputs (the "output" blocks of the
+                            template) for later steps. They are read from the state once the Job succeeds,
+                            as one JSON object {"<output name>": value}, so From is a JSON Pointer such as
+                            /vpc_id or /ips/0. Terraform outputs marked sensitive are always kept in the Secret.
+                          items:
+                            description: |-
+                              WorkflowOutput publishes one named value from a JSON response so that later steps
+                              can use it, instead of depending on the shape of the previous response.
+                            properties:
+                              defaultJSON:
+                                description: |-
+                                  DefaultJSON is the JSON value used when From does not exist in the response
+                                  (for example "eu-1", 3 or null). Without it, a missing value fails the workflow.
+                                maxLength: 1024
+                                type: string
+                              from:
+                                description: From is a JSON Pointer into the response,
+                                  for example /id.
+                                maxLength: 512
+                                pattern: ^/.*$
+                                type: string
+                              name:
+                                description: Name identifies the output within its
+                                  step.
+                                maxLength: 63
+                                pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
+                                type: string
+                              sensitive:
+                                description: Sensitive stores the value in a per-workflow
+                                  Secret instead of the Workflow status.
+                                type: boolean
+                            required:
+                            - from
+                            - name
+                            type: object
+                          maxItems: 32
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        state:
+                          description: State says where the Terraform state of this
+                            step lives.
+                          properties:
+                            key:
+                              description: |-
+                                Key names the resource this step manages, for example "vdc/acme/network". Workflows
+                                that use the same key in the same namespace share one state, even at different times,
+                                so a later run with changed inputs modifies the existing resources. Concurrent runs on
+                                the same key do not overlap: the second one fails on the state lock.
+
+                                Segments are separated by "/" and use letters, digits, ".", "_" and "-". A segment can
+                                contain placeholders {{steps.<step>.outputs.<name>}} that are replaced by the output of
+                                an earlier step, which must be a string, number or boolean made of the same characters.
+                              maxLength: 512
+                              minLength: 1
+                              pattern: ^[A-Za-z0-9._{}/ -]+$
+                              type: string
+                          required:
+                          - key
+                          type: object
+                        templateRef:
+                          description: |-
+                            TemplateRef names the TerraformTemplate whose files this step runs. Its files are
+                            copied when the step starts; later edits of the template do not affect it.
+                          properties:
+                            name:
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
                         timeoutSeconds:
                           default: 1800
                           description: Maximum wall time for the Terraform Job.
@@ -347,7 +417,8 @@ spec:
                           minimum: 1
                           type: integer
                       required:
-                      - templateConfigMap
+                      - state
+                      - templateRef
                       type: object
                   required:
                   - name
@@ -361,8 +432,9 @@ spec:
                 x-kubernetes-list-type: atomic
               workspaceStorage:
                 default: 2Gi
-                description: WorkspaceStorage requests a per-workflow PVC for Terraform
-                  state and working files.
+                description: |-
+                  WorkspaceStorage requests a per-workflow PVC for the Terraform working files (rendered
+                  templates, providers). Terraform state does not live here: see WorkflowTerraformState.
                 pattern: ^[1-9][0-9]*(Mi|Gi|Ti)$
                 type: string
             required:
@@ -372,8 +444,6 @@ spec:
             - message: Workflow spec is immutable; create a new workflow to change
                 its steps
               rule: self == oldSelf
-            - message: at most one Terraform step is supported per workflow
-              rule: self.steps.filter(s, has(s.terraform)).size() <= 1
           status:
             description: status defines the observed state of Workflow
             properties:
@@ -497,6 +567,10 @@ spec:
                       maxItems: 32
                       type: array
                       x-kubernetes-list-type: set
+                    stateKey:
+                      description: StateKey is the object key of the step's Terraform
+                        state in the state storage.
+                      type: string
                   required:
                   - name
                   - phase

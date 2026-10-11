@@ -30,3 +30,19 @@ spec:
     #     templateRef: {name: apicalltemplate-sample}
     #     inputs:
     #       - {step: login, output: token, to: /auth/token}
+    #
+    # A Terraform step runs a TerraformTemplate (see kmetal_v1alpha1_terraformtemplate.yaml);
+    # its inputs become the Terraform variables ("to" names the variable).
+    #
+    # - name: provision
+    #   terraform:
+    #     templateRef: {name: terraformtemplate-sample}
+    #     # Workflows that use the same key in the same namespace share one Terraform state, so a
+    #     # later run with changed inputs modifies the resources instead of creating them again.
+    #     state:
+    #       key: vdc/{{steps.create-resource.outputs.vdcId}}/network
+    #     envFromSecrets: [tfstate-credentials]   # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    #     inputs:
+    #       - {step: create-resource, output: vdcId, to: /vdc_id}
+    #     outputs:
+    #       - {name: networkId, from: /network_id}

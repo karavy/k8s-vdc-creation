@@ -18,8 +18,8 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.currentStep
-      name: Step
+    - jsonPath: .status.currentTemplate
+      name: Template
       type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -49,400 +49,80 @@ spec:
           spec:
             description: spec defines the desired state of Workflow
             properties:
-              steps:
-                description: Steps run strictly in order. A step starts only after
-                  its predecessor succeeds.
+              templates:
+                description: |-
+                  Templates run strictly in order. A template starts only after the one before it has
+                  completed, and the first one that fails stops the Workflow. When the Workflow is deleted,
+                  the deleteSteps of the templates that ran are executed in the opposite order.
                 items:
-                  description: WorkflowStep is exactly one API or Terraform operation.
+                  description: WorkflowTemplateRun is one use of a WorkflowTemplate
+                    by a Workflow.
                   properties:
-                    api:
-                      description: |-
-                        WorkflowAPIStep runs an ApiCall created from an existing ApiCallTemplate and
-                        may poll until ready.
-                      properties:
-                        inputs:
-                          description: |-
-                            Inputs set values published by earlier steps (see Outputs) into the copied body.
-                            The body must be a JSON object.
-                          items:
-                            description: WorkflowInput sets an output published by
-                              an earlier step into a JSON object.
-                            properties:
-                              output:
-                                description: Output is the name of the output declared
-                                  by that step.
-                                maxLength: 63
-                                pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
-                                type: string
-                              step:
-                                description: |-
-                                  Step is the name of the step that publishes the output. It must come before the
-                                  current step (a poll may also use outputs of its own step's initial request).
-                                maxLength: 40
-                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                                type: string
-                              to:
-                                description: To is a non-root JSON Pointer into the
-                                  target object, for example /vdcId.
-                                maxLength: 512
-                                pattern: ^/.+$
-                                type: string
-                            required:
-                            - output
-                            - step
-                            - to
-                            type: object
-                          maxItems: 32
-                          type: array
-                          x-kubernetes-list-type: atomic
-                        outputs:
-                          description: |-
-                            Outputs publish values from this request's response, by name, for later steps.
-                            With a poll, they are read from the initial response; add poll.outputs to
-                            publish values from the final poll response.
-                          items:
-                            description: |-
-                              WorkflowOutput publishes one named value from a JSON response so that later steps
-                              can use it, instead of depending on the shape of the previous response.
-                            properties:
-                              defaultJSON:
-                                description: |-
-                                  DefaultJSON is the JSON value used when From does not exist in the response
-                                  (for example "eu-1", 3 or null). Without it, a missing value fails the workflow.
-                                maxLength: 1024
-                                type: string
-                              from:
-                                description: From is a JSON Pointer into the response,
-                                  for example /id.
-                                maxLength: 512
-                                pattern: ^/.*$
-                                type: string
-                              name:
-                                description: Name identifies the output within its
-                                  step.
-                                maxLength: 63
-                                pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
-                                type: string
-                              sensitive:
-                                description: Sensitive stores the value in a per-workflow
-                                  Secret instead of the Workflow status.
-                                type: boolean
-                            required:
-                            - from
-                            - name
-                            type: object
-                          maxItems: 32
-                          type: array
-                          x-kubernetes-list-type: atomic
-                        poll:
-                          description: Poll repeats a read request until the JSON
-                            response satisfies the condition.
-                          properties:
-                            conditionJSONPointer:
-                              description: JSON Pointer into the polling response.
-                              pattern: ^/.*$
-                              type: string
-                            equalsJSON:
-                              description: Expected value as JSON (for example true,
-                                "ready", or 3).
-                              maxLength: 1024
-                              type: string
-                            inputs:
-                              description: |-
-                                Inputs set published values into each poll request body. They may use outputs
-                                of earlier steps and of this step's initial request.
-                              items:
-                                description: WorkflowInput sets an output published
-                                  by an earlier step into a JSON object.
-                                properties:
-                                  output:
-                                    description: Output is the name of the output
-                                      declared by that step.
-                                    maxLength: 63
-                                    pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
-                                    type: string
-                                  step:
-                                    description: |-
-                                      Step is the name of the step that publishes the output. It must come before the
-                                      current step (a poll may also use outputs of its own step's initial request).
-                                    maxLength: 40
-                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                                    type: string
-                                  to:
-                                    description: To is a non-root JSON Pointer into
-                                      the target object, for example /vdcId.
-                                    maxLength: 512
-                                    pattern: ^/.+$
-                                    type: string
-                                required:
-                                - output
-                                - step
-                                - to
-                                type: object
-                              maxItems: 32
-                              type: array
-                              x-kubernetes-list-type: atomic
-                            intervalSeconds:
-                              default: 5
-                              format: int32
-                              maximum: 3600
-                              minimum: 1
-                              type: integer
-                            maxAttempts:
-                              default: 20
-                              format: int32
-                              maximum: 100
-                              minimum: 1
-                              type: integer
-                            outputs:
-                              description: |-
-                                Outputs publish values from the final poll response, the one that satisfies
-                                the condition. Names must differ from the step's own outputs.
-                              items:
-                                description: |-
-                                  WorkflowOutput publishes one named value from a JSON response so that later steps
-                                  can use it, instead of depending on the shape of the previous response.
-                                properties:
-                                  defaultJSON:
-                                    description: |-
-                                      DefaultJSON is the JSON value used when From does not exist in the response
-                                      (for example "eu-1", 3 or null). Without it, a missing value fails the workflow.
-                                    maxLength: 1024
-                                    type: string
-                                  from:
-                                    description: From is a JSON Pointer into the response,
-                                      for example /id.
-                                    maxLength: 512
-                                    pattern: ^/.*$
-                                    type: string
-                                  name:
-                                    description: Name identifies the output within
-                                      its step.
-                                    maxLength: 63
-                                    pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
-                                    type: string
-                                  sensitive:
-                                    description: Sensitive stores the value in a per-workflow
-                                      Secret instead of the Workflow status.
-                                    type: boolean
-                                required:
-                                - from
-                                - name
-                                type: object
-                              maxItems: 32
-                              type: array
-                              x-kubernetes-list-type: atomic
-                            retryOnStatusCodes:
-                              description: |-
-                                RetryOnStatusCodes lists HTTP statuses of a poll response (for example 404 or 503)
-                                that mean "not ready yet" instead of a failure. Such a poll consumes one of
-                                maxAttempts. Any other non-2xx status fails the workflow. It never applies to
-                                the step's initial request.
-                              items:
-                                format: int32
-                                maximum: 599
-                                minimum: 100
-                                type: integer
-                              maxItems: 16
-                              type: array
-                              x-kubernetes-list-type: set
-                            retryOnTransportErrors:
-                              description: |-
-                                RetryOnTransportErrors treats a poll that timed out or failed at the network
-                                level as "not ready yet". Invalid requests and oversized responses still fail.
-                              type: boolean
-                            templateRef:
-                              description: TemplateRef names the ApiCallTemplate used
-                                for each polling request.
-                              properties:
-                                name:
-                                  maxLength: 253
-                                  minLength: 1
-                                  type: string
-                              required:
-                              - name
-                              type: object
-                          required:
-                          - conditionJSONPointer
-                          - templateRef
-                          type: object
-                        templateRef:
-                          description: |-
-                            TemplateRef names the ApiCallTemplate that defines this step's request.
-                            The Workflow runs a child ApiCall created from it, owned by the Workflow.
-                          properties:
-                            name:
-                              maxLength: 253
-                              minLength: 1
-                              type: string
-                          required:
-                          - name
-                          type: object
-                      required:
-                      - templateRef
-                      type: object
                     name:
+                      description: |-
+                        Name identifies this use inside the Workflow, and prefixes the names of the objects it
+                        creates. The same template can be used twice under two names.
                       maxLength: 40
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
-                    terraform:
+                    parameters:
                       description: |-
-                        WorkflowTerraformStep provisions infrastructure with terraform-engine. Its state is kept
-                        in S3-compatible storage under State.Key, independently of the workflow: any later
-                        workflow that uses the same key works on the same state and so on the same resources.
-                        Every Terraform step works in its own folder of the workflow's workspace, named after
-                        the step, so a workflow can have any number of them.
-                      properties:
-                        envFromSecrets:
-                          description: |-
-                            Secret names in the workflow namespace whose keys are exposed as environment variables to the Terraform Job.
-                            The storage credentials (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) must come from one of them.
-                          items:
+                        Parameters give a value to the parameters the template declares. A parameter that
+                        the template does not declare is refused, and so is a missing one that has no default.
+                      items:
+                        description: WorkflowParameter is a named string value.
+                        properties:
+                          name:
+                            maxLength: 63
+                            pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
                             type: string
-                          maxItems: 8
-                          type: array
-                        inputs:
-                          description: |-
-                            Inputs set values published by earlier steps into terraform.auto.tfvars.json;
-                            To is a JSON pointer such as /cluster_id naming the Terraform variable.
-                          items:
-                            description: WorkflowInput sets an output published by
-                              an earlier step into a JSON object.
-                            properties:
-                              output:
-                                description: Output is the name of the output declared
-                                  by that step.
-                                maxLength: 63
-                                pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
-                                type: string
-                              step:
-                                description: |-
-                                  Step is the name of the step that publishes the output. It must come before the
-                                  current step (a poll may also use outputs of its own step's initial request).
-                                maxLength: 40
-                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                                type: string
-                              to:
-                                description: To is a non-root JSON Pointer into the
-                                  target object, for example /vdcId.
-                                maxLength: 512
-                                pattern: ^/.+$
-                                type: string
-                            required:
-                            - output
-                            - step
-                            - to
-                            type: object
-                          maxItems: 32
-                          type: array
-                          x-kubernetes-list-type: atomic
-                        outputs:
-                          description: |-
-                            Outputs publish values from the Terraform outputs (the "output" blocks of the
-                            template) for later steps. They are read from the state once the Job succeeds,
-                            as one JSON object {"<output name>": value}, so From is a JSON Pointer such as
-                            /vpc_id or /ips/0. Terraform outputs marked sensitive are always kept in the Secret.
-                          items:
-                            description: |-
-                              WorkflowOutput publishes one named value from a JSON response so that later steps
-                              can use it, instead of depending on the shape of the previous response.
-                            properties:
-                              defaultJSON:
-                                description: |-
-                                  DefaultJSON is the JSON value used when From does not exist in the response
-                                  (for example "eu-1", 3 or null). Without it, a missing value fails the workflow.
-                                maxLength: 1024
-                                type: string
-                              from:
-                                description: From is a JSON Pointer into the response,
-                                  for example /id.
-                                maxLength: 512
-                                pattern: ^/.*$
-                                type: string
-                              name:
-                                description: Name identifies the output within its
-                                  step.
-                                maxLength: 63
-                                pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
-                                type: string
-                              sensitive:
-                                description: Sensitive stores the value in a per-workflow
-                                  Secret instead of the Workflow status.
-                                type: boolean
-                            required:
-                            - from
-                            - name
-                            type: object
-                          maxItems: 32
-                          type: array
-                          x-kubernetes-list-type: atomic
-                        state:
-                          description: State says where the Terraform state of this
-                            step lives.
-                          properties:
-                            key:
-                              description: |-
-                                Key names the resource this step manages, for example "vdc/acme/network". Workflows
-                                that use the same key in the same namespace share one state, even at different times,
-                                so a later run with changed inputs modifies the existing resources. Concurrent runs on
-                                the same key do not overlap: the second one fails on the state lock.
-
-                                Segments are separated by "/" and use letters, digits, ".", "_" and "-". A segment can
-                                contain placeholders {{steps.<step>.outputs.<name>}} that are replaced by the output of
-                                an earlier step, which must be a string, number or boolean made of the same characters.
-                              maxLength: 512
-                              minLength: 1
-                              pattern: ^[A-Za-z0-9._{}/ -]+$
-                              type: string
-                          required:
-                          - key
-                          type: object
-                        templateRef:
-                          description: |-
-                            TemplateRef names the TerraformTemplate whose files this step runs. Its files are
-                            copied when the step starts; later edits of the template do not affect it.
-                          properties:
-                            name:
-                              maxLength: 253
-                              minLength: 1
-                              type: string
-                          required:
-                          - name
-                          type: object
-                        timeoutSeconds:
-                          default: 1800
-                          description: Maximum wall time for the Terraform Job.
-                          format: int32
-                          maximum: 7200
-                          minimum: 1
-                          type: integer
+                          value:
+                            maxLength: 1024
+                            type: string
+                        required:
+                        - name
+                        - value
+                        type: object
+                      maxItems: 32
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - name
+                      x-kubernetes-list-type: map
+                    templateRef:
+                      description: TemplateRef names the WorkflowTemplate to run,
+                        in the Workflow's namespace.
+                      properties:
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
                       required:
-                      - state
-                      - templateRef
+                      - name
                       type: object
                   required:
                   - name
+                  - templateRef
                   type: object
-                  x-kubernetes-validations:
-                  - message: exactly one of api or terraform must be set
-                    rule: has(self.api) != has(self.terraform)
                 maxItems: 20
                 minItems: 1
                 type: array
-                x-kubernetes-list-type: atomic
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               workspaceStorage:
                 default: 2Gi
                 description: |-
-                  WorkspaceStorage requests a per-workflow PVC for the Terraform working files (rendered
-                  templates, providers). Terraform state does not live here: see WorkflowTerraformState.
+                  WorkspaceStorage requests, for each template that has a Terraform step, a PVC for the
+                  Terraform working files (rendered templates, providers). Terraform state does not live
+                  here: see WorkflowTerraformState.
                 pattern: ^[1-9][0-9]*(Mi|Gi|Ti)$
                 type: string
             required:
-            - steps
+            - templates
             type: object
             x-kubernetes-validations:
             - message: Workflow spec is immutable; create a new workflow to change
-                its steps
+                what it runs
               rule: self == oldSelf
           status:
             description: status defines the observed state of Workflow
@@ -506,17 +186,30 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              currentStep:
-                description: Index of the next step; zero-based.
+              currentTemplate:
+                description: Index of the template that runs next; zero-based.
                 format: int32
                 type: integer
+              deletion:
+                description: Deletion is set once the Workflow is being deleted and
+                  a template that ran has deleteSteps.
+                properties:
+                  currentTemplate:
+                    description: |-
+                      Index of the template being cleaned up; zero-based. It goes down, from the last
+                      template that ran to the first.
+                    format: int32
+                    type: integer
+                  phase:
+                    enum:
+                    - Running
+                    - Succeeded
+                    - Failed
+                    type: string
+                type: object
               observedGeneration:
                 format: int64
                 type: integer
-              outputsSecretName:
-                description: Name of the Secret holding the workflow's sensitive outputs,
-                  if any.
-                type: string
               phase:
                 enum:
                 - Pending
@@ -525,51 +218,174 @@ spec:
                 - Failed
                 - Unknown
                 type: string
-              steps:
+              templates:
                 items:
                   description: |-
-                    WorkflowStepStatus records execution progress. Besides the declared non-sensitive
-                    outputs, no API response data is copied into the Workflow status.
+                    WorkflowTemplateStatus records the progress of one template of the Workflow. Besides the
+                    declared non-sensitive outputs, no API response data is copied into the status.
                   properties:
-                    apiCallName:
-                      type: string
-                    attempts:
+                    currentStep:
+                      description: Index of the next step of the template; zero-based.
                       format: int32
                       type: integer
-                    jobName:
-                      type: string
-                    message:
-                      type: string
-                    name:
-                      type: string
-                    outputs:
-                      additionalProperties:
-                        type: string
-                      description: Outputs holds the step's non-sensitive output values,
-                        JSON-encoded, by name.
-                      maxProperties: 32
+                    deletion:
+                      description: Deletion records the template's deleteSteps once
+                        the Workflow is being deleted.
+                      properties:
+                        currentStep:
+                          description: Index of the next delete step; zero-based.
+                          format: int32
+                          type: integer
+                        phase:
+                          enum:
+                          - Running
+                          - Succeeded
+                          - Failed
+                          type: string
+                        steps:
+                          items:
+                            description: |-
+                              WorkflowStepStatus records execution progress. Besides the declared non-sensitive
+                              outputs, no API response data is copied into the Workflow status.
+                            properties:
+                              apiCallName:
+                                type: string
+                              attempts:
+                                format: int32
+                                type: integer
+                              jobName:
+                                type: string
+                              message:
+                                type: string
+                              name:
+                                type: string
+                              nextAttemptAt:
+                                description: NextAttemptAt is when a retry of the
+                                  step's request is due.
+                                format: date-time
+                                type: string
+                              outputs:
+                                additionalProperties:
+                                  type: string
+                                description: Outputs holds the step's non-sensitive
+                                  output values, JSON-encoded, by name.
+                                maxProperties: 32
+                                type: object
+                              phase:
+                                enum:
+                                - Pending
+                                - Running
+                                - Polling
+                                - Succeeded
+                                - Failed
+                                - Unknown
+                                - Skipped
+                                type: string
+                              sensitiveOutputs:
+                                description: |-
+                                  SensitiveOutputs lists the output names whose values live in the workflow's
+                                  outputs Secret, under the key "<step>.<output>". Values are never shown here.
+                                items:
+                                  type: string
+                                maxItems: 32
+                                type: array
+                                x-kubernetes-list-type: set
+                              stateKey:
+                                description: StateKey is the object key of the step's
+                                  Terraform state in the state storage.
+                                type: string
+                            required:
+                            - name
+                            - phase
+                            type: object
+                          type: array
+                          x-kubernetes-list-map-keys:
+                          - name
+                          x-kubernetes-list-type: map
                       type: object
+                    name:
+                      description: Name is the name of the template use, from spec.templates.
+                      type: string
+                    outputsSecretName:
+                      description: Name of the Secret holding this template's sensitive
+                        outputs, if any.
+                      type: string
                     phase:
                       enum:
                       - Pending
                       - Running
-                      - Polling
                       - Succeeded
                       - Failed
                       - Unknown
                       type: string
-                    sensitiveOutputs:
-                      description: |-
-                        SensitiveOutputs lists the output names whose values live in the workflow's
-                        outputs Secret, under the key "<step>.<output>". Values are never shown here.
+                    steps:
                       items:
-                        type: string
-                      maxItems: 32
+                        description: |-
+                          WorkflowStepStatus records execution progress. Besides the declared non-sensitive
+                          outputs, no API response data is copied into the Workflow status.
+                        properties:
+                          apiCallName:
+                            type: string
+                          attempts:
+                            format: int32
+                            type: integer
+                          jobName:
+                            type: string
+                          message:
+                            type: string
+                          name:
+                            type: string
+                          nextAttemptAt:
+                            description: NextAttemptAt is when a retry of the step's
+                              request is due.
+                            format: date-time
+                            type: string
+                          outputs:
+                            additionalProperties:
+                              type: string
+                            description: Outputs holds the step's non-sensitive output
+                              values, JSON-encoded, by name.
+                            maxProperties: 32
+                            type: object
+                          phase:
+                            enum:
+                            - Pending
+                            - Running
+                            - Polling
+                            - Succeeded
+                            - Failed
+                            - Unknown
+                            - Skipped
+                            type: string
+                          sensitiveOutputs:
+                            description: |-
+                              SensitiveOutputs lists the output names whose values live in the workflow's
+                              outputs Secret, under the key "<step>.<output>". Values are never shown here.
+                            items:
+                              type: string
+                            maxItems: 32
+                            type: array
+                            x-kubernetes-list-type: set
+                          stateKey:
+                            description: StateKey is the object key of the step's
+                              Terraform state in the state storage.
+                            type: string
+                        required:
+                        - name
+                        - phase
+                        type: object
                       type: array
-                      x-kubernetes-list-type: set
-                    stateKey:
-                      description: StateKey is the object key of the step's Terraform
-                        state in the state storage.
+                      x-kubernetes-list-map-keys:
+                      - name
+                      x-kubernetes-list-type: map
+                    templateGeneration:
+                      description: |-
+                        TemplateGeneration is the generation of the WorkflowTemplate when it started. If the
+                        template is edited while it runs, the Workflow fails instead of mixing two versions.
+                      format: int64
+                      type: integer
+                    workspacePVCName:
+                      description: PVC for the Terraform files of this template.
                       type: string
                   required:
                   - name
@@ -579,9 +395,6 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
-              workspacePVCName:
-                description: Per-workflow PVC for Terraform files and state.
-                type: string
             type: object
         required:
         - spec

@@ -53,6 +53,11 @@ type ApiCallSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	StoreResponseBody *bool `json:"storeResponseBody,omitempty"`
+	// Debug validates the request and logs it, without sending it. The ApiCall then
+	// succeeds with no response, so a Workflow step cannot publish outputs from it. The log
+	// has the method, endpoint, header names (never their values) and the body.
+	// +optional
+	Debug bool `json:"debug,omitempty"`
 	// ExecutionID distinguishes otherwise identical ApiCalls. The spec is immutable,
 	// so it cannot be used to re-run an existing ApiCall.
 	// +kubebuilder:validation:MaxLength=128

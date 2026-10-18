@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"regexp"
 	"slices"
-	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -40,7 +40,10 @@ const (
 	stepPhaseSucceeded     = "Succeeded"
 	stepPhaseFailed        = "Failed"
 	stepPhaseUnknown       = "Unknown"
+	stepPhaseSkipped       = "Skipped"
 	workflowPollInterval   = 2 * time.Second
+	// deletionFinalizer keeps a Workflow whose templates have deleteSteps until they have run.
+	deletionFinalizer = "kmetal.dinova.one/workflow-deletion"
 )
 
 var errTemplateUnavailable = errors.New("referenced ApiCallTemplate was not found")
@@ -58,54 +61,6 @@ type Handler struct {
 	TerraformState terraform.StateConfig
 }
 
-func (r *Handler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	workflow := &kmetalv1alpha1.Workflow{}
-	if err := r.Get(ctx, req.NamespacedName, workflow); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-	if !workflow.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, nil
-	}
-	if workflow.Status.ObservedGeneration != workflow.Generation {
-		workflow.Status = kmetalv1alpha1.WorkflowStatus{
-			ObservedGeneration: workflow.Generation,
-			Phase:              workflowPhasePending,
-			Steps:              initialStepStatuses(workflow.Spec.Steps),
-		}
-		if err := validateReferences(workflow.Spec.Steps); err != nil {
-			workflow.Status.Phase = workflowPhaseFailed
-			setWorkflowCondition(workflow, metav1.ConditionFalse, "Ready", "InvalidReference", err.Error())
-			return ctrl.Result{}, r.Status().Update(ctx, workflow)
-		}
-		setWorkflowCondition(workflow, metav1.ConditionTrue, "Progressing", "Started", "Workflow execution initialized")
-		if err := r.Status().Update(ctx, workflow); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
-	}
-	if workflow.Status.Phase == workflowPhaseSucceeded || workflow.Status.Phase == workflowPhaseFailed || workflow.Status.Phase == workflowPhaseUnknown {
-		return ctrl.Result{}, nil
-	}
-	if int(workflow.Status.CurrentStep) >= len(workflow.Spec.Steps) {
-		workflow.Status.Phase = workflowPhaseSucceeded
-		setWorkflowCondition(workflow, metav1.ConditionTrue, "Ready", "Completed", "All workflow steps completed")
-		return ctrl.Result{}, r.Status().Update(ctx, workflow)
-	}
-	workflow.Status.Phase = workflowPhaseRunning
-	step := workflow.Spec.Steps[workflow.Status.CurrentStep]
-	stepStatus := findStepStatus(&workflow.Status, step.Name)
-	if stepStatus == nil {
-		return ctrl.Result{}, fmt.Errorf("workflow status has no entry for step %q", step.Name)
-	}
-	if step.API != nil {
-		return r.reconcileAPIStep(ctx, workflow, step, stepStatus)
-	}
-	if step.Terraform != nil {
-		return r.reconcileTerraformStep(ctx, workflow, step, stepStatus)
-	}
-	return r.failWorkflow(ctx, workflow, stepStatus, "InvalidStep", "Workflow step has no operation")
-}
-
 func initialStepStatuses(steps []kmetalv1alpha1.WorkflowStep) []kmetalv1alpha1.WorkflowStepStatus {
 	statuses := make([]kmetalv1alpha1.WorkflowStepStatus, 0, len(steps))
 	for _, step := range steps {
@@ -114,42 +69,50 @@ func initialStepStatuses(steps []kmetalv1alpha1.WorkflowStep) []kmetalv1alpha1.W
 	return statuses
 }
 
-func findStepStatus(status *kmetalv1alpha1.WorkflowStatus, name string) *kmetalv1alpha1.WorkflowStepStatus {
-	for i := range status.Steps {
-		if status.Steps[i].Name == name {
-			return &status.Steps[i]
-		}
-	}
-	return nil
+// skipStep completes a delete step that has nothing to undo.
+func (r *Handler) skipStep(ctx context.Context, run *templateRun, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
+	state.Phase = stepPhaseSkipped
+	state.Message = "Skipped: an input of this step comes from a step that did not complete, so there is nothing to undo"
+	run.advance()
+	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, run.owner)
 }
 
-func (r *Handler) reconcileAPIStep(ctx context.Context, workflow *kmetalv1alpha1.Workflow, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
+func (r *Handler) reconcileAPIStep(ctx context.Context, run *templateRun, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
 	apiStep := step.API
 	if state.Phase == stepPhasePending {
-		call, err := r.buildAPICall(ctx, workflow, step.Name, "initial", apiStep.TemplateRef.Name, apiStep.Inputs)
+		call, err := r.buildAPICall(ctx, run, step.Name, "initial", apiStep.TemplateRef.Name, apiStep.Inputs, apiStep.Debug)
 		if errors.Is(err, errTemplateUnavailable) {
-			return r.failWorkflow(ctx, workflow, state, "ApiCallTemplateUnavailable", fmt.Sprintf("Referenced ApiCallTemplate %q was not found", apiStep.TemplateRef.Name))
+			return r.failWorkflow(ctx, run, state, "ApiCallTemplateUnavailable", fmt.Sprintf("Referenced ApiCallTemplate %q was not found", apiStep.TemplateRef.Name))
+		}
+		if errors.Is(err, errOutputNotPublished) && run.deleting() {
+			return r.skipStep(ctx, run, state)
 		}
 		if err != nil {
-			return r.failWorkflow(ctx, workflow, state, "RequestBuildFailed", "Could not build the API request from the published step outputs")
+			return r.failBuild(ctx, run, state, err, "RequestBuildFailed", "Could not build the API request from the step outputs, parameters and ConfigMaps")
 		}
-		if err := r.createOwned(ctx, workflow, call); err != nil {
+		if apiStep.Retry != nil && call.Spec.Method != http.MethodGet {
+			return r.failWorkflow(ctx, run, state, "RetryNotAllowed", fmt.Sprintf("Step %q sets retry, but retry is only allowed for GET requests", step.Name))
+		}
+		if err := r.createOwned(ctx, run.owner, call); err != nil {
 			return ctrl.Result{}, err
 		}
 		state.Phase = stepPhaseRunning
 		state.APICallName = call.Name
 		state.Attempts = 1
 		state.Message = "Initial API request submitted"
-		return ctrl.Result{RequeueAfter: workflowPollInterval}, r.Status().Update(ctx, workflow)
+		return ctrl.Result{RequeueAfter: workflowPollInterval}, r.Status().Update(ctx, run.owner)
 	}
 	if state.APICallName == "" {
-		return r.createPollCall(ctx, workflow, step, state)
+		if state.Phase == stepPhaseRunning {
+			return r.createRetryCall(ctx, run, step, state)
+		}
+		return r.createPollCall(ctx, run, step, state)
 	}
 	call := &kmetalv1alpha1.ApiCall{}
-	key := types.NamespacedName{Namespace: workflow.Namespace, Name: state.APICallName}
+	key := types.NamespacedName{Namespace: run.owner.Namespace, Name: state.APICallName}
 	if err := r.Get(ctx, key, call); err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.failWorkflow(ctx, workflow, state, "ChildCallLost", "Workflow child ApiCall was not found")
+			return r.failWorkflow(ctx, run, state, "ChildCallLost", "Workflow child ApiCall was not found")
 		}
 		return ctrl.Result{}, err
 	}
@@ -157,63 +120,102 @@ func (r *Handler) reconcileAPIStep(ctx context.Context, workflow *kmetalv1alpha1
 	case "Pending", "Running", "":
 		return ctrl.Result{RequeueAfter: workflowPollInterval}, nil
 	case "Unknown":
-		return r.failWorkflow(ctx, workflow, state, "ChildCallUnknown", "Child ApiCall execution is unknown; workflow will not replay it")
+		return r.failWorkflow(ctx, run, state, "ChildCallUnknown", "Child ApiCall execution is unknown; workflow will not replay it")
 	case "Failed":
-		if state.Phase == stepPhasePolling && pollFailureTolerated(call, apiStep.Poll) {
-			return r.scheduleNextPoll(ctx, workflow, apiStep.Poll, state, "Poll request failed with a tolerated error; another poll will be scheduled")
-		}
-		return r.failWorkflow(ctx, workflow, state, "ChildCallFailed", fmt.Sprintf("API step %q failed", step.Name))
+		return r.reconcileFailedCall(ctx, run, step, state, call)
 	case callPhaseSucceeded:
 	default:
-		return r.failWorkflow(ctx, workflow, state, "InvalidChildPhase", "Child ApiCall reported an invalid phase")
+		return r.failWorkflow(ctx, run, state, "InvalidChildPhase", "Child ApiCall reported an invalid phase")
+	}
+	if call.Spec.Debug {
+		return r.completeDebugStep(ctx, run, apiStep, state)
 	}
 	if call.Status.Response == nil || call.Status.Response.Truncated {
-		return r.failWorkflow(ctx, workflow, state, "ResponseUnavailable", "API response is missing or truncated")
+		return r.failWorkflow(ctx, run, state, "ResponseUnavailable", "API response is missing or truncated")
+	}
+	if state.Phase == stepPhaseRunning {
+		if err := checkExpectations(call.Status.Response.Body, apiStep.Expect); err != nil {
+			return r.outputError(ctx, run, state, err)
+		}
 	}
 	if state.Phase == stepPhaseRunning && apiStep.Poll != nil {
-		if err := r.captureOutputs(ctx, workflow, state, apiStep.Outputs, call.Status.Response.Body); err != nil {
-			return r.outputError(ctx, workflow, state, err)
+		if err := r.captureOutputs(ctx, run, state, apiStep.Outputs, call.Status.Response.Body); err != nil {
+			return r.outputError(ctx, run, state, err)
 		}
 		state.Phase = stepPhasePolling
 		state.APICallName = ""
 		state.Attempts = 0
 		state.Message = "Initial request completed; polling for readiness"
-		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, workflow)
+		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, run.owner)
 	}
 	if state.Phase == stepPhasePolling {
 		ready, err := pollCondition(call.Status.Response.Body, apiStep.Poll)
 		if err != nil {
-			return r.failWorkflow(ctx, workflow, state, "PollResponseInvalid", "Polling response did not contain valid JSON at the configured pointer")
+			return r.failWorkflow(ctx, run, state, "PollResponseInvalid", "Polling response did not contain valid JSON at the configured pointer")
 		}
 		if ready {
-			if err := r.captureOutputs(ctx, workflow, state, apiStep.Poll.Outputs, call.Status.Response.Body); err != nil {
-				return r.outputError(ctx, workflow, state, err)
+			if err := r.captureOutputs(ctx, run, state, apiStep.Poll.Outputs, call.Status.Response.Body); err != nil {
+				return r.outputError(ctx, run, state, err)
 			}
 			state.Phase = stepPhaseSucceeded
 			state.Message = "Polling condition satisfied"
-			workflow.Status.CurrentStep++
-			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, workflow)
+			run.advance()
+			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, run.owner)
 		}
-		return r.scheduleNextPoll(ctx, workflow, apiStep.Poll, state, "Polling condition not satisfied; another poll will be scheduled")
+		return r.scheduleNextPoll(ctx, run, apiStep.Poll, state, "Polling condition not satisfied; another poll will be scheduled")
 	}
-	if err := r.captureOutputs(ctx, workflow, state, apiStep.Outputs, call.Status.Response.Body); err != nil {
-		return r.outputError(ctx, workflow, state, err)
+	if err := r.captureOutputs(ctx, run, state, apiStep.Outputs, call.Status.Response.Body); err != nil {
+		return r.outputError(ctx, run, state, err)
 	}
 	state.Phase = stepPhaseSucceeded
 	state.Message = fmt.Sprintf("API step completed with HTTP %d", call.Status.Response.StatusCode)
-	workflow.Status.CurrentStep++
-	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, workflow)
+	run.advance()
+	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, run.owner)
+}
+
+// reconcileFailedCall decides what a failed child ApiCall means for its step: a poll or a
+// retry that tolerates the failure goes on, anything else fails the workflow.
+func (r *Handler) reconcileFailedCall(ctx context.Context, run *templateRun, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus, call *kmetalv1alpha1.ApiCall) (ctrl.Result, error) {
+	apiStep := step.API
+	if state.Phase == stepPhasePolling && pollFailureTolerated(call, apiStep.Poll) {
+		return r.scheduleNextPoll(ctx, run, apiStep.Poll, state, "Poll request failed with a tolerated error; another poll will be scheduled")
+	}
+	if state.Phase == stepPhaseRunning && apiStep.Retry != nil && failureTolerated(call, apiStep.Retry.StatusCodes, retryOnTransportErrors(apiStep.Retry)) {
+		return r.scheduleRetry(ctx, run, step, state)
+	}
+	return r.failWorkflow(ctx, run, state, "ChildCallFailed", fmt.Sprintf("API step %q failed", step.Name))
+}
+
+// completeDebugStep ends a step whose request was logged and not sent. There is no response,
+// so the outputs that declare a debugJSON are published with that value, and the template
+// outputs are built as usual; the others are not published.
+func (r *Handler) completeDebugStep(ctx context.Context, run *templateRun, apiStep *kmetalv1alpha1.WorkflowAPIStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
+	var outputs []kmetalv1alpha1.WorkflowOutput
+	for _, output := range apiStep.Outputs {
+		if output.Template != "" {
+			outputs = append(outputs, output) // built from known values, so there is no response to miss
+		} else if output.DebugJSON != "" {
+			outputs = append(outputs, kmetalv1alpha1.WorkflowOutput{Name: output.Name, From: "/debug", DefaultJSON: output.DebugJSON, Sensitive: output.Sensitive})
+		}
+	}
+	if err := r.captureOutputs(ctx, run, state, outputs, []byte(`{}`)); err != nil {
+		return r.outputError(ctx, run, state, err)
+	}
+	state.Phase = stepPhaseSucceeded
+	state.Message = "Debug is enabled: the request was logged by the operator and not sent"
+	run.advance()
+	return ctrl.Result{Requeue: true}, r.Status().Update(ctx, run.owner)
 }
 
 // scheduleNextPoll ends the current poll attempt as "not ready": it fails the workflow
 // once maxAttempts is used up, otherwise it requeues after the poll interval.
-func (r *Handler) scheduleNextPoll(ctx context.Context, workflow *kmetalv1alpha1.Workflow, poll *kmetalv1alpha1.WorkflowPoll, state *kmetalv1alpha1.WorkflowStepStatus, message string) (ctrl.Result, error) {
+func (r *Handler) scheduleNextPoll(ctx context.Context, run *templateRun, poll *kmetalv1alpha1.WorkflowPoll, state *kmetalv1alpha1.WorkflowStepStatus, message string) (ctrl.Result, error) {
 	maxAttempts := poll.MaxAttempts
 	if maxAttempts == 0 {
 		maxAttempts = 20
 	}
 	if state.Attempts >= maxAttempts {
-		return r.failWorkflow(ctx, workflow, state, "PollTimeout", "Polling condition was not satisfied within maxAttempts")
+		return r.failWorkflow(ctx, run, state, "PollTimeout", "Polling condition was not satisfied within maxAttempts")
 	}
 	state.APICallName = ""
 	state.Message = message
@@ -221,54 +223,136 @@ func (r *Handler) scheduleNextPoll(ctx context.Context, workflow *kmetalv1alpha1
 	if interval == 0 {
 		interval = 5
 	}
-	return ctrl.Result{RequeueAfter: time.Duration(interval) * time.Second}, r.Status().Update(ctx, workflow)
+	return ctrl.Result{RequeueAfter: time.Duration(interval) * time.Second}, r.Status().Update(ctx, run.owner)
 }
 
 // pollFailureTolerated reports whether a failed poll ApiCall is one the poll was
 // configured to treat as "not ready yet". Invalid requests, oversized responses and
 // lost executions are never tolerated.
 func pollFailureTolerated(call *kmetalv1alpha1.ApiCall, poll *kmetalv1alpha1.WorkflowPoll) bool {
+	return failureTolerated(call, poll.RetryOnStatusCodes, poll.RetryOnTransportErrors)
+}
+
+// failureTolerated reports whether a failed ApiCall failed with one of the listed HTTP
+// statuses, or at the network level when transport errors are accepted.
+func failureTolerated(call *kmetalv1alpha1.ApiCall, statusCodes []int32, transportErrors bool) bool {
 	ready := meta.FindStatusCondition(call.Status.Conditions, "Ready")
 	if ready == nil {
 		return false
 	}
 	switch ready.Reason {
 	case "HTTPError":
-		return call.Status.Response != nil && slices.Contains(poll.RetryOnStatusCodes, int32(call.Status.Response.StatusCode))
+		return call.Status.Response != nil && slices.Contains(statusCodes, int32(call.Status.Response.StatusCode))
 	case "Timeout", "RequestFailed":
-		return poll.RetryOnTransportErrors
+		return transportErrors
 	}
 	return false
 }
 
-func (r *Handler) createPollCall(ctx context.Context, workflow *kmetalv1alpha1.Workflow, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
-	poll := step.API.Poll
-	if poll == nil {
-		return r.failWorkflow(ctx, workflow, state, "PollMissing", "Polling state has no poll configuration")
+const (
+	defaultRetryAttempts = 3
+	defaultRetryBackoff  = 5
+)
+
+func retryMaxAttempts(retry *kmetalv1alpha1.WorkflowRetry) int32 {
+	if retry.MaxAttempts == 0 {
+		return defaultRetryAttempts
+	}
+	return retry.MaxAttempts
+}
+
+func retryBackoff(retry *kmetalv1alpha1.WorkflowRetry) time.Duration {
+	if retry.BackoffSeconds == 0 {
+		return defaultRetryBackoff * time.Second
+	}
+	return time.Duration(retry.BackoffSeconds) * time.Second
+}
+
+// retryOnTransportErrors is true unless the step says otherwise.
+func retryOnTransportErrors(retry *kmetalv1alpha1.WorkflowRetry) bool {
+	return retry.OnTransportErrors == nil || *retry.OnTransportErrors
+}
+
+// scheduleRetry ends a failed attempt of the initial request: it fails the workflow once
+// maxAttempts requests have been made, otherwise it records when the next one is due.
+func (r *Handler) scheduleRetry(ctx context.Context, run *templateRun, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
+	retry := step.API.Retry
+	if state.Attempts >= retryMaxAttempts(retry) {
+		return r.failWorkflow(ctx, run, state, "RetriesExhausted", fmt.Sprintf("API step %q failed after %d attempts", step.Name, state.Attempts))
+	}
+	backoff := retryBackoff(retry)
+	due := metav1.NewTime(time.Now().Add(backoff))
+	state.APICallName = ""
+	state.NextAttemptAt = &due
+	state.Message = fmt.Sprintf("Request failed with a retryable error; attempt %d of %d is due in %s", state.Attempts+1, retryMaxAttempts(retry), backoff)
+	return ctrl.Result{RequeueAfter: backoff}, r.Status().Update(ctx, run.owner)
+}
+
+// createRetryCall sends the next attempt of the initial request once its backoff is over.
+// A reconcile that arrives earlier, for example after a status update, waits for the rest.
+func (r *Handler) createRetryCall(ctx context.Context, run *templateRun, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
+	if state.NextAttemptAt != nil {
+		if wait := time.Until(state.NextAttemptAt.Time); wait > 0 {
+			return ctrl.Result{RequeueAfter: wait}, nil
+		}
 	}
 	state.Attempts++
-	call, err := r.buildAPICall(ctx, workflow, step.Name, fmt.Sprintf("poll-%02d", state.Attempts), poll.TemplateRef.Name, poll.Inputs)
+	call, err := r.buildAPICall(ctx, run, step.Name, fmt.Sprintf("retry-%02d", state.Attempts), step.API.TemplateRef.Name, step.API.Inputs, step.API.Debug)
 	if errors.Is(err, errTemplateUnavailable) {
 		state.Attempts--
-		return r.failWorkflow(ctx, workflow, state, "ApiCallTemplateUnavailable", fmt.Sprintf("Referenced ApiCallTemplate %q was not found", poll.TemplateRef.Name))
+		return r.failWorkflow(ctx, run, state, "ApiCallTemplateUnavailable", fmt.Sprintf("Referenced ApiCallTemplate %q was not found", step.API.TemplateRef.Name))
 	}
 	if err != nil {
-		return r.failWorkflow(ctx, workflow, state, "PollBuildFailed", "Could not build the polling request from the published step outputs")
+		return r.failBuild(ctx, run, state, err, "RequestBuildFailed", "Could not build the API request from the step outputs, parameters and ConfigMaps")
 	}
-	if err := r.createOwned(ctx, workflow, call); err != nil {
+	if err := r.createOwned(ctx, run.owner, call); err != nil {
+		state.Attempts--
+		return ctrl.Result{}, err
+	}
+	state.APICallName = call.Name
+	state.NextAttemptAt = nil
+	state.Message = fmt.Sprintf("Retry %d of the API request submitted", state.Attempts)
+	return ctrl.Result{RequeueAfter: workflowPollInterval}, r.Status().Update(ctx, run.owner)
+}
+
+func (r *Handler) createPollCall(ctx context.Context, run *templateRun, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
+	poll := step.API.Poll
+	if poll == nil {
+		return r.failWorkflow(ctx, run, state, "PollMissing", "Polling state has no poll configuration")
+	}
+	state.Attempts++
+	call, err := r.buildAPICall(ctx, run, step.Name, fmt.Sprintf("poll-%02d", state.Attempts), poll.TemplateRef.Name, poll.Inputs, false)
+	if errors.Is(err, errTemplateUnavailable) {
+		state.Attempts--
+		return r.failWorkflow(ctx, run, state, "ApiCallTemplateUnavailable", fmt.Sprintf("Referenced ApiCallTemplate %q was not found", poll.TemplateRef.Name))
+	}
+	if err != nil {
+		return r.failBuild(ctx, run, state, err, "PollBuildFailed", "Could not build the polling request from the step outputs, parameters and ConfigMaps")
+	}
+	if err := r.createOwned(ctx, run.owner, call); err != nil {
 		state.Attempts--
 		return ctrl.Result{}, err
 	}
 	state.APICallName = call.Name
 	state.Message = fmt.Sprintf("Polling attempt %d submitted", state.Attempts)
-	return ctrl.Result{RequeueAfter: workflowPollInterval}, r.Status().Update(ctx, workflow)
+	return ctrl.Result{RequeueAfter: workflowPollInterval}, r.Status().Update(ctx, run.owner)
+}
+
+// failBuild fails the workflow with the reason of an input that cannot be resolved when it
+// says why (a missing ConfigMap or parameter), and with the generic one otherwise.
+func (r *Handler) failBuild(ctx context.Context, run *templateRun, state *kmetalv1alpha1.WorkflowStepStatus, err error, reason, message string) (ctrl.Result, error) {
+	var failure *outputFailure
+	if errors.As(err, &failure) {
+		return r.failWorkflow(ctx, run, state, failure.reason, failure.message)
+	}
+	return r.failWorkflow(ctx, run, state, reason, message)
 }
 
 // buildAPICall returns a Workflow-owned ApiCall created from the named ApiCallTemplate.
 // Templates are never executed; the ApiCall controller only runs Workflow-owned calls.
-func (r *Handler) buildAPICall(ctx context.Context, workflow *kmetalv1alpha1.Workflow, stepName, suffix, templateName string, inputs []kmetalv1alpha1.WorkflowInput) (*kmetalv1alpha1.ApiCall, error) {
+func (r *Handler) buildAPICall(ctx context.Context, run *templateRun, stepName, suffix, templateName string, inputs []kmetalv1alpha1.WorkflowInput, debug bool) (*kmetalv1alpha1.ApiCall, error) {
 	template := &kmetalv1alpha1.ApiCallTemplate{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: workflow.Namespace, Name: templateName}, template); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Namespace: run.owner.Namespace, Name: templateName}, template); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, errTemplateUnavailable
 		}
@@ -277,10 +361,20 @@ func (r *Handler) buildAPICall(ctx context.Context, workflow *kmetalv1alpha1.Wor
 	spec := &kmetalv1alpha1.ApiCallSpec{
 		Method: template.Spec.Method, Endpoint: template.Spec.Endpoint, Body: template.Spec.Body,
 		Headers: maps.Clone(template.Spec.Headers), Authentication: template.Spec.Authentication.DeepCopy(),
-		TimeoutSeconds: template.Spec.TimeoutSeconds,
+		TimeoutSeconds: template.Spec.TimeoutSeconds, Debug: template.Spec.Debug || debug,
 	}
 	if len(inputs) > 0 {
-		body, err := applyInputs([]byte(spec.Body), inputs, r.outputResolver(ctx, workflow))
+		resolve := r.inputResolver(ctx, run)
+		endpoint, err := applyPathInputs(spec.Endpoint, inputs, resolve)
+		if err != nil {
+			return nil, err
+		}
+		endpoint, err = applyQueryInputs(endpoint, inputs, resolve)
+		if err != nil {
+			return nil, err
+		}
+		spec.Endpoint = endpoint
+		body, err := applyInputs([]byte(spec.Body), inputs, resolve)
 		if err != nil {
 			return nil, err
 		}
@@ -293,126 +387,127 @@ func (r *Handler) buildAPICall(ctx context.Context, workflow *kmetalv1alpha1.Wor
 	}
 	call := &kmetalv1alpha1.ApiCall{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: workflow.Namespace,
-			Name:      workflowChildName(workflow, stepName, suffix),
+			Namespace: run.owner.Namespace,
+			Name:      run.childName(stepName, suffix),
 			Labels: map[string]string{
-				"kmetal.dinova.one/workflow":      workflow.Name,
-				"kmetal.dinova.one/workflow-step": stepName,
+				"kmetal.dinova.one/workflow":          run.owner.Name,
+				"kmetal.dinova.one/workflow-template": run.name,
+				"kmetal.dinova.one/workflow-step":     stepName,
 			},
 			Annotations: map[string]string{"kmetal.dinova.one/api-call-template": templateName},
 		},
 		Spec: *spec,
 	}
-	return call, controllerutil.SetControllerReference(workflow, call, r.Scheme)
+	return call, controllerutil.SetControllerReference(run.owner, call, r.Scheme)
 }
 
-func (r *Handler) reconcileTerraformStep(ctx context.Context, workflow *kmetalv1alpha1.Workflow, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
+func (r *Handler) reconcileTerraformStep(ctx context.Context, run *templateRun, step kmetalv1alpha1.WorkflowStep, state *kmetalv1alpha1.WorkflowStepStatus) (ctrl.Result, error) {
 	tf := step.Terraform
 	if state.Phase == stepPhasePending {
-		workspace, err := r.ensureWorkspacePVC(ctx, workflow)
+		workspace, err := r.ensureWorkspacePVC(ctx, run)
 		if err != nil {
-			return r.failWorkflow(ctx, workflow, state, "WorkspaceFailed", "Could not create Terraform workspace PVC")
+			return r.failWorkflow(ctx, run, state, "WorkspaceFailed", "Could not create Terraform workspace PVC")
 		}
 		// The Job is created even if the claim is still Pending: storage classes with
 		// WaitForFirstConsumer (Kind's default) bind a volume only once a pod uses it, so
 		// waiting for Bound here would wait forever. The Job's deadline bounds a claim that
 		// never binds.
 		if !r.TerraformState.Configured() {
-			return r.failWorkflow(ctx, workflow, state, "StateBackendNotConfigured", "The operator has no Terraform state storage configured (--tfstate-s3-* flags)")
+			return r.failWorkflow(ctx, run, state, "StateBackendNotConfigured", "The operator has no Terraform state storage configured (--tfstate-s3-* flags)")
 		}
-		stateKey, err := renderStateKey(tf.State.Key, r.outputResolver(ctx, workflow))
+		stateKey, err := renderStateKey(tf.State.Key, r.outputResolver(ctx, run))
 		if err != nil {
-			return r.failWorkflow(ctx, workflow, state, "StateKeyInvalid", err.Error())
+			return r.failWorkflow(ctx, run, state, "StateKeyInvalid", err.Error())
 		}
-		backend := r.TerraformState.Backend(terraform.ObjectKey(workflow.Namespace, stateKey))
+		backend := r.TerraformState.Backend(terraform.ObjectKey(run.owner.Namespace, stateKey))
 		if err := backend.Validate(); err != nil {
-			return r.failWorkflow(ctx, workflow, state, "StateKeyInvalid", err.Error())
+			return r.failWorkflow(ctx, run, state, "StateKeyInvalid", err.Error())
 		}
 		state.StateKey = backend.Key
 		template := &kmetalv1alpha1.TerraformTemplate{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: workflow.Namespace, Name: tf.TemplateRef.Name}, template); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Namespace: run.owner.Namespace, Name: tf.TemplateRef.Name}, template); err != nil {
 			if apierrors.IsNotFound(err) {
-				return r.failWorkflow(ctx, workflow, state, "TerraformTemplateUnavailable", fmt.Sprintf("Referenced TerraformTemplate %q was not found", tf.TemplateRef.Name))
+				return r.failWorkflow(ctx, run, state, "TerraformTemplateUnavailable", fmt.Sprintf("Referenced TerraformTemplate %q was not found", tf.TemplateRef.Name))
 			}
 			return ctrl.Result{}, err
 		}
 		files, err := terraform.ConfigMapData(template)
 		if err != nil {
-			return r.failWorkflow(ctx, workflow, state, "TerraformTemplateInvalid", err.Error())
+			return r.failWorkflow(ctx, run, state, "TerraformTemplateInvalid", err.Error())
 		}
 		// The files are copied now, so later edits of the template never change a running step.
 		templateFiles := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: workflow.Namespace, Name: workflowChildName(workflow, step.Name, "tf-template"),
-				Labels:      map[string]string{"kmetal.dinova.one/workflow": workflow.Name},
+				Namespace: run.owner.Namespace, Name: run.childName(step.Name, "tf-template"),
+				Labels:      map[string]string{"kmetal.dinova.one/workflow": run.owner.Name},
 				Annotations: map[string]string{"kmetal.dinova.one/terraform-template": tf.TemplateRef.Name},
 			},
 			Data: files,
 		}
-		if err := r.createOwned(ctx, workflow, templateFiles); err != nil {
+		if err := r.createOwned(ctx, run.owner, templateFiles); err != nil {
 			return ctrl.Result{}, err
 		}
-		variables, err := applyInputs([]byte(`{}`), tf.Inputs, r.outputResolver(ctx, workflow))
+		variables, err := applyInputs([]byte(`{}`), tf.Inputs, r.inputResolver(ctx, run))
 		if err != nil {
-			return r.failWorkflow(ctx, workflow, state, "VariablesMappingFailed", "Could not build Terraform variables from the published step outputs")
+			return r.failBuild(ctx, run, state, err, "VariablesMappingFailed", "Could not build Terraform variables from the step outputs, parameters and ConfigMaps")
 		}
 		inputSecret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: workflow.Namespace, Name: workflowChildName(workflow, step.Name, "tf-input"),
-				Labels: map[string]string{"kmetal.dinova.one/workflow": workflow.Name},
+				Namespace: run.owner.Namespace, Name: run.childName(step.Name, "tf-input"),
+				Labels: map[string]string{"kmetal.dinova.one/workflow": run.owner.Name},
 			},
 			Type: corev1.SecretTypeOpaque,
 			Data: map[string][]byte{terraform.VariablesKey: variables},
 		}
-		if err := controllerutil.SetControllerReference(workflow, inputSecret, r.Scheme); err != nil {
+		if err := controllerutil.SetControllerReference(run.owner, inputSecret, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.createOwned(ctx, workflow, inputSecret); err != nil {
+		if err := r.createOwned(ctx, run.owner, inputSecret); err != nil {
 			return ctrl.Result{}, err
 		}
 		job, err := terraform.NewJob(terraform.JobConfig{
-			Namespace: workflow.Namespace, Name: workflowChildName(workflow, step.Name, "terraform"), StepName: step.Name,
+			Namespace: run.owner.Namespace, Name: run.childName(step.Name, "terraform"), StepName: step.Name,
 			RunnerImage: r.TerraformRunnerImage, WorkspacePVC: workspace.Name,
 			TemplateConfigMap: templateFiles.Name, InputSecret: inputSecret.Name,
 			TimeoutSeconds: tf.TimeoutSeconds, EnvFromSecrets: tf.EnvFromSecrets, State: backend,
-			Labels: map[string]string{"kmetal.dinova.one/workflow": workflow.Name},
+			Labels: map[string]string{"kmetal.dinova.one/workflow": run.owner.Name},
 		})
 		if err != nil {
-			return r.failWorkflow(ctx, workflow, state, "TerraformJobInvalid", "Could not prepare Terraform Job")
+			return r.failWorkflow(ctx, run, state, "TerraformJobInvalid", "Could not prepare Terraform Job")
 		}
-		if err := r.createOwned(ctx, workflow, job); err != nil {
+		if err := r.createOwned(ctx, run.owner, job); err != nil {
 			return ctrl.Result{}, err
 		}
 		state.Phase = stepPhaseRunning
 		state.JobName = job.Name
 		state.Message = "Terraform Job submitted"
-		return ctrl.Result{RequeueAfter: workflowPollInterval}, r.Status().Update(ctx, workflow)
+		return ctrl.Result{RequeueAfter: workflowPollInterval}, r.Status().Update(ctx, run.owner)
 	}
 	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: workflow.Namespace, Name: state.JobName}, job); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Namespace: run.owner.Namespace, Name: state.JobName}, job); err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.failWorkflow(ctx, workflow, state, "TerraformJobLost", "Terraform Job was not found")
+			return r.failWorkflow(ctx, run, state, "TerraformJobLost", "Terraform Job was not found")
 		}
 		return ctrl.Result{}, err
 	}
 	if job.Status.Succeeded > 0 {
-		if err := r.captureTerraformOutputs(ctx, workflow, state, tf); err != nil {
-			return r.outputError(ctx, workflow, state, err)
+		if err := r.captureTerraformOutputs(ctx, run, state, tf); err != nil {
+			return r.outputError(ctx, run, state, err)
 		}
 		state.Phase = stepPhaseSucceeded
 		state.Message = "Terraform apply completed"
-		workflow.Status.CurrentStep++
-		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, workflow)
+		run.status.CurrentStep++
+		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, run.owner)
 	}
 	if job.Status.Failed > 0 || job.Status.Active == 0 && job.Status.StartTime != nil && time.Since(job.Status.StartTime.Time) > 2*time.Minute {
-		return r.failWorkflow(ctx, workflow, state, "TerraformJobFailed", "Terraform Job failed; inspect its pod logs")
+		return r.failWorkflow(ctx, run, state, "TerraformJobFailed", "Terraform Job failed; inspect its pod logs")
 	}
 	return ctrl.Result{RequeueAfter: workflowPollInterval}, nil
 }
 
 // captureTerraformOutputs publishes the step's declared outputs from the Terraform state
 // the Job has just written. Without declared outputs the state is not even read.
-func (r *Handler) captureTerraformOutputs(ctx context.Context, workflow *kmetalv1alpha1.Workflow, state *kmetalv1alpha1.WorkflowStepStatus, tf *kmetalv1alpha1.WorkflowTerraformStep) error {
+func (r *Handler) captureTerraformOutputs(ctx context.Context, run *templateRun, state *kmetalv1alpha1.WorkflowStepStatus, tf *kmetalv1alpha1.WorkflowTerraformStep) error {
 	if len(tf.Outputs) == 0 {
 		return nil
 	}
@@ -427,7 +522,7 @@ func (r *Handler) captureTerraformOutputs(ctx context.Context, workflow *kmetalv
 	if err != nil {
 		return &outputFailure{"StateInvalid", "The Terraform state could not be read for its outputs"}
 	}
-	return r.captureOutputs(ctx, workflow, state, tf.Outputs, document, sensitiveDeclared(tf.Outputs, sensitive)...)
+	return r.captureOutputs(ctx, run, state, tf.Outputs, document, sensitiveDeclared(tf.Outputs, sensitive)...)
 }
 
 // sensitiveDeclared returns the names of the declared outputs that read from a Terraform
@@ -444,18 +539,18 @@ func sensitiveDeclared(declared []kmetalv1alpha1.WorkflowOutput, sensitiveTerraf
 	return names
 }
 
-func (r *Handler) ensureWorkspacePVC(ctx context.Context, workflow *kmetalv1alpha1.Workflow) (*corev1.PersistentVolumeClaim, error) {
-	name := workflowChildName(workflow, "workspace", "pvc")
+func (r *Handler) ensureWorkspacePVC(ctx context.Context, run *templateRun) (*corev1.PersistentVolumeClaim, error) {
+	name := run.childName("workspace", "pvc")
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: workflow.Namespace, Name: name}, pvc)
+	err := r.Get(ctx, types.NamespacedName{Namespace: run.owner.Namespace, Name: name}, pvc)
 	if err == nil {
-		workflow.Status.WorkspacePVCName = name
+		run.status.WorkspacePVCName = name
 		return pvc, nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return nil, err
 	}
-	storage := workflow.Spec.WorkspaceStorage
+	storage := run.owner.Spec.WorkspaceStorage
 	if storage == "" {
 		storage = "2Gi"
 	}
@@ -464,19 +559,19 @@ func (r *Handler) ensureWorkspacePVC(ctx context.Context, workflow *kmetalv1alph
 		return nil, err
 	}
 	pvc = &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Namespace: workflow.Namespace, Name: name},
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.owner.Namespace, Name: name},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: quantity}},
 		},
 	}
-	if err := controllerutil.SetControllerReference(workflow, pvc, r.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(run.owner, pvc, r.Scheme); err != nil {
 		return nil, err
 	}
 	if err := r.Create(ctx, pvc); err != nil && !apierrors.IsAlreadyExists(err) {
 		return nil, err
 	}
-	workflow.Status.WorkspacePVCName = name
+	run.status.WorkspacePVCName = name
 	return pvc, nil
 }
 
@@ -517,38 +612,19 @@ func (r *Handler) createOwned(ctx context.Context, owner, object client.Object) 
 
 // outputError fails the workflow for output problems that retrying cannot fix and
 // returns any other error so that the reconciler retries.
-func (r *Handler) outputError(ctx context.Context, workflow *kmetalv1alpha1.Workflow, state *kmetalv1alpha1.WorkflowStepStatus, err error) (ctrl.Result, error) {
+func (r *Handler) outputError(ctx context.Context, run *templateRun, state *kmetalv1alpha1.WorkflowStepStatus, err error) (ctrl.Result, error) {
 	var failure *outputFailure
 	if errors.As(err, &failure) {
-		return r.failWorkflow(ctx, workflow, state, failure.reason, failure.message)
+		return r.failWorkflow(ctx, run, state, failure.reason, failure.message)
 	}
 	return ctrl.Result{}, err
 }
 
-func (r *Handler) failWorkflow(ctx context.Context, workflow *kmetalv1alpha1.Workflow, state *kmetalv1alpha1.WorkflowStepStatus, reason, message string) (ctrl.Result, error) {
+func (r *Handler) failWorkflow(ctx context.Context, run *templateRun, state *kmetalv1alpha1.WorkflowStepStatus, reason, message string) (ctrl.Result, error) {
 	state.Phase, state.Message = stepPhaseFailed, message
-	workflow.Status.Phase = workflowPhaseFailed
-	setWorkflowCondition(workflow, metav1.ConditionFalse, "Ready", reason, message)
-	return ctrl.Result{}, r.Status().Update(ctx, workflow)
-}
-
-func setWorkflowCondition(workflow *kmetalv1alpha1.Workflow, status metav1.ConditionStatus, conditionType, reason, message string) {
-	meta.SetStatusCondition(&workflow.Status.Conditions, metav1.Condition{
-		Type: conditionType, Status: status, ObservedGeneration: workflow.Generation,
-		Reason: reason, Message: message,
-	})
-}
-
-func workflowChildName(workflow *kmetalv1alpha1.Workflow, step, suffix string) string {
-	uid := string(workflow.UID)
-	if len(uid) > 6 {
-		uid = uid[:6]
+	if run.deleting() && run.status.Deletion != nil {
+		run.status.Deletion.Phase = workflowPhaseFailed
+		return r.failDeletion(ctx, run.owner, reason, message)
 	}
-	base := strings.Trim(dnsSanitizer.ReplaceAllString(strings.ToLower(workflow.Name+"-"+step), "-"), "-")
-	tail := "-" + uid + "-" + suffix
-	maxBase := 63 - len(tail)
-	if len(base) > maxBase {
-		base = strings.TrimRight(base[:maxBase], "-")
-	}
-	return base + tail
+	return r.failStage(ctx, run.owner, run.status, reason, message)
 }

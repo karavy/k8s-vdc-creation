@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	apiengine "github.com/karavy/api-engine/pkg/apiengine"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -646,5 +648,125 @@ func TestAPIExecutorCanceledQueueEntry(t *testing.T) {
 	waitAPI(t, func() bool { _, done, _ := executor.lookup(three); return done })
 	if requests.Load() != 2 {
 		t.Fatal("unexpected HTTP operations after queue cancellation")
+	}
+}
+
+func TestParseOrigins(t *testing.T) {
+	got := ParseOrigins("# portale\nhttps://a.example.com, https://b.example.com:8443\n\n  # off\nhttps://c.example.com\n")
+	want := []string{"https://a.example.com", "https://b.example.com:8443", "https://c.example.com"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("ParseOrigins = %v, want %v", got, want)
+	}
+	if len(ParseOrigins("")) != 0 {
+		t.Fatal("empty text must give no origins")
+	}
+}
+
+func TestOriginsConfigMapExtendsTheAllowlist(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	call := testAPICall("https://portal.example.com/api", http.MethodGet)
+	configMapName := types.NamespacedName{Namespace: "operator", Name: "origins"}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "operator", Name: "origins"},
+		Data:       map[string]string{OriginsConfigMapKey: "# portale\nhttps://portal.example.com\nhttps://bad.example.com/path\n"},
+	}
+	r := apiTestReconciler(t, server, call, configMap)
+
+	if _, _, err := r.buildRequest(context.Background(), call); !errors.Is(err, errInvalidRequest) {
+		t.Fatalf("without a ConfigMap the origin must be denied, got %v", err)
+	}
+	r.OriginsConfigMap = configMapName
+	if _, _, err := r.buildRequest(context.Background(), call); err != nil {
+		t.Fatalf("origin listed in the ConfigMap was denied: %v", err)
+	}
+	bad := testAPICall("https://bad.example.com/api", http.MethodGet)
+	if _, _, err := r.buildRequest(context.Background(), bad); !errors.Is(err, errInvalidRequest) {
+		t.Fatalf("an entry with a path must be ignored, got %v", err)
+	}
+	if _, _, err := r.buildRequest(context.Background(), testAPICall(server.URL, http.MethodGet)); err != nil {
+		t.Fatalf("an origin from the flag must still be allowed: %v", err)
+	}
+
+	configMap.Data[OriginsConfigMapKey] = ""
+	if err := r.Update(context.Background(), configMap); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.buildRequest(context.Background(), call); !errors.Is(err, errInvalidRequest) {
+		t.Fatalf("an edit of the ConfigMap must apply to the next request, got %v", err)
+	}
+
+	r.OriginsConfigMap = types.NamespacedName{Namespace: "operator", Name: "missing"}
+	if _, _, err := r.buildRequest(context.Background(), call); !errors.Is(err, errInvalidRequest) {
+		t.Fatalf("a missing ConfigMap must deny, got %v", err)
+	}
+}
+
+type failingReader struct{ client.Reader }
+
+func (failingReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return errors.New("apiserver unavailable")
+}
+
+func TestOriginsConfigMapReadErrorIsRetriedNotFailed(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	call := testAPICall("https://portal.example.com/api", http.MethodGet)
+	r := apiTestReconciler(t, server, call)
+	r.OriginsConfigMap = types.NamespacedName{Namespace: "operator", Name: "origins"}
+	r.APIReader = failingReader{}
+	if _, _, err := r.buildRequest(context.Background(), call); !errors.Is(err, errOriginsUnavailable) {
+		t.Fatalf("a read error must be reported as retryable, got %v", err)
+	}
+}
+
+func TestDebugApiCallLogsTheRequestAndSendsNothing(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	call := testAPICall(server.URL+"/segments/create", http.MethodPost)
+	call.Spec.Debug = true
+	call.Spec.Body = `{"client_name":"ACME"}`
+	call.Spec.Headers = map[string]string{"Content-Type": "application/json"}
+	call.Spec.Authentication = &kmetalv1alpha1.APIAuthentication{
+		Type: apiAuthKey, HeaderName: "X-API-Key",
+		TokenSecretRef: &kmetalv1alpha1.APISecretKeyReference{Name: "key", Key: "api-key"},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "key", Namespace: "default"}, Data: map[string][]byte{"api-key": []byte("super-secret-key")}}
+	r := apiTestReconciler(t, server, call, secret)
+
+	var logged []string
+	logger := funcr.New(func(prefix, args string) { logged = append(logged, prefix+args) }, funcr.Options{})
+	ctx := logr.NewContext(context.Background(), logger)
+	name := types.NamespacedName{Name: call.Name, Namespace: call.Namespace}
+	for range 2 {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Get(ctx, name, call); err != nil {
+		t.Fatal(err)
+	}
+
+	if call.Status.Phase != apiPhaseSucceeded || call.Status.Response != nil {
+		t.Fatalf("phase = %s, response = %v; want Succeeded and no response", call.Status.Phase, call.Status.Response)
+	}
+	if ready := meta.FindStatusCondition(call.Status.Conditions, "Ready"); ready == nil || ready.Reason != "DebugSkipped" {
+		t.Fatalf("Ready condition = %v, want reason DebugSkipped", ready)
+	}
+	if requests.Load() != 0 {
+		t.Fatal("a debug ApiCall sent its request")
+	}
+	output := strings.Join(logged, "\n")
+	for _, want := range []string{"Skipped ApiCall request because debug is enabled", `client_name`, "ACME", "X-Api-Key", "POST"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("log lacks %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "super-secret-key") {
+		t.Fatalf("the credential reached the log:\n%s", output)
+	}
+	if len(logged) != 1 {
+		t.Fatalf("the request was logged %d times, want once", len(logged))
 	}
 }

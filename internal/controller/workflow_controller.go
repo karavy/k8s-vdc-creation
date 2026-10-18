@@ -45,9 +45,10 @@ type WorkflowReconciler struct {
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=workflows/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=apicalls,verbs=get;create
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=apicalltemplates,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kmetal.dinova.one,resources=workflowtemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=terraformtemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update
 

@@ -191,6 +191,12 @@ spec:
                   or other text.
                 maxLength: 65536
                 type: string
+              debug:
+                description: |-
+                  Debug validates the request and logs it, without sending it. The ApiCall then
+                  succeeds with no response, so a Workflow step cannot publish outputs from it. The log
+                  has the method, endpoint, header names (never their values) and the body.
+                type: boolean
               endpoint:
                 description: Endpoint must also be permitted by the operator's origin
                   allowlist.

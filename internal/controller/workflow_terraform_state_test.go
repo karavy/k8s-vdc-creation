@@ -105,9 +105,9 @@ var _ = Describe("Workflow Terraform state and outputs", func() {
 		}
 
 		states := &fakeStateReader{}
-		workflow := &kmetalv1alpha1.Workflow{
+		workflow := createWorkflowFor(&kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "terraform-state-chain", Namespace: "default"},
-			Spec: kmetalv1alpha1.WorkflowSpec{WorkspaceStorage: "1Gi", Steps: []kmetalv1alpha1.WorkflowStep{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{
 				{Name: "create-vdc", API: apiStepOf("state-create-vdc", func(s *kmetalv1alpha1.WorkflowAPIStep) {
 					s.Outputs = []kmetalv1alpha1.WorkflowOutput{{Name: "vdcName", From: "/name"}}
 				})},
@@ -129,9 +129,7 @@ var _ = Describe("Workflow Terraform state and outputs", func() {
 					},
 				}},
 			}},
-		}
-		Expect(k8sClient.Create(ctx, workflow)).To(Succeed())
-		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workflow)).To(Succeed()) })
+		}, "1Gi")
 
 		name := types.NamespacedName{Name: workflow.Name, Namespace: workflow.Namespace}
 		executor := startExecutor()
@@ -167,15 +165,15 @@ var _ = Describe("Workflow Terraform state and outputs", func() {
 		var current *kmetalv1alpha1.Workflow
 		Eventually(func() int32 {
 			current = step()
-			return current.Status.CurrentStep
+			return stage(current).CurrentStep
 		}, 30*time.Second, 20*time.Millisecond).Should(Equal(int32(1)))
 		var claim *corev1.PersistentVolumeClaim
-		Eventually(func() *kmetalv1alpha1.Workflow {
+		Eventually(func() string {
 			current = step()
-			return current
-		}, 10*time.Second, 20*time.Millisecond).Should(HaveField("Status.WorkspacePVCName", Not(BeEmpty())))
+			return stage(current).WorkspacePVCName
+		}, 10*time.Second, 20*time.Millisecond).ShouldNot(BeEmpty())
 		claim = &corev1.PersistentVolumeClaim{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: name.Namespace, Name: current.Status.WorkspacePVCName}, claim)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: name.Namespace, Name: stage(current).WorkspacePVCName}, claim)).To(Succeed())
 		claim.Status.Phase = corev1.ClaimBound
 		Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
 		step()
@@ -229,17 +227,15 @@ var _ = Describe("Workflow Terraform state and outputs", func() {
 		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, template)).To(Succeed()) })
 
 		run := func(name, stateKey string, config terraform.StateConfig, outputs []kmetalv1alpha1.WorkflowOutput) (*kmetalv1alpha1.Workflow, *batchv1.Job) {
-			workflow := &kmetalv1alpha1.Workflow{
+			createWorkflowFor(&kmetalv1alpha1.WorkflowTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-				Spec: kmetalv1alpha1.WorkflowSpec{WorkspaceStorage: "1Gi", Steps: []kmetalv1alpha1.WorkflowStep{{
+				Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{{
 					Name: "apply", Terraform: &kmetalv1alpha1.WorkflowTerraformStep{
 						TemplateRef: kmetalv1alpha1.WorkflowResourceReference{Name: template.Name},
 						State:       kmetalv1alpha1.WorkflowTerraformState{Key: stateKey}, Outputs: outputs,
 					},
 				}}},
-			}
-			Expect(k8sClient.Create(ctx, workflow)).To(Succeed())
-			DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workflow)).To(Succeed()) })
+			}, "1Gi")
 			key := types.NamespacedName{Name: name, Namespace: "default"}
 			reconciler := &WorkflowReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), TerraformRunnerImage: "runner:test", TerraformState: config}
 			reconcileOnce := func() *kmetalv1alpha1.Workflow {
@@ -249,10 +245,11 @@ var _ = Describe("Workflow Terraform state and outputs", func() {
 				Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
 				return current
 			}
-			reconcileOnce()
+			reconcileOnce() // initializes the status
+			reconcileOnce() // starts the template
 			current := reconcileOnce()
 			claim := &corev1.PersistentVolumeClaim{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: current.Status.WorkspacePVCName}, claim)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: stage(current).WorkspacePVCName}, claim)).To(Succeed())
 			claim.Status.Phase = corev1.ClaimBound
 			Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
 			current = reconcileOnce()
@@ -290,27 +287,25 @@ var _ = Describe("Workflow Terraform state and outputs", func() {
 		}
 		Expect(k8sClient.Create(ctx, template)).To(Succeed())
 		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, template)).To(Succeed()) })
-		workflow := &kmetalv1alpha1.Workflow{
+		workflow := createWorkflowFor(&kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "terraform-pending-claim", Namespace: "default"},
-			Spec: kmetalv1alpha1.WorkflowSpec{WorkspaceStorage: "1Gi", Steps: []kmetalv1alpha1.WorkflowStep{{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{{
 				Name: "apply", Terraform: &kmetalv1alpha1.WorkflowTerraformStep{
 					TemplateRef: kmetalv1alpha1.WorkflowResourceReference{Name: template.Name},
 					State:       kmetalv1alpha1.WorkflowTerraformState{Key: "pending/claim"},
 				},
 			}}},
-		}
-		Expect(k8sClient.Create(ctx, workflow)).To(Succeed())
-		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workflow)).To(Succeed()) })
+		}, "1Gi")
 		name := types.NamespacedName{Name: workflow.Name, Namespace: workflow.Namespace}
 		reconciler := &WorkflowReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), TerraformRunnerImage: "runner:test", TerraformState: testStateConfig(nil)}
-		for range 3 {
+		for range 4 {
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
 			Expect(err).NotTo(HaveOccurred())
 		}
 		current := &kmetalv1alpha1.Workflow{}
 		Expect(k8sClient.Get(ctx, name, current)).To(Succeed())
 		claim := &corev1.PersistentVolumeClaim{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: name.Namespace, Name: current.Status.WorkspacePVCName}, claim)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: name.Namespace, Name: stage(current).WorkspacePVCName}, claim)).To(Succeed())
 		Expect(claim.Status.Phase).NotTo(Equal(corev1.ClaimBound), "the claim stays Pending: nothing binds it in this test")
 		jobs := &batchv1.JobList{}
 		Expect(k8sClient.List(ctx, jobs, client.InNamespace(name.Namespace), client.MatchingLabels{"kmetal.dinova.one/workflow": name.Name})).To(Succeed())
@@ -318,10 +313,10 @@ var _ = Describe("Workflow Terraform state and outputs", func() {
 		Expect(stepStatus(current, "apply").Phase).To(Equal("Running"))
 	})
 
-	It("rejects a workflow whose Terraform step has no state key", func() {
-		workflow := &kmetalv1alpha1.Workflow{
+	It("rejects a template whose Terraform step has no state key", func() {
+		workflow := &kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{GenerateName: "no-state-", Namespace: "default"},
-			Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{{
 				Name: "apply", Terraform: &kmetalv1alpha1.WorkflowTerraformStep{TemplateRef: kmetalv1alpha1.WorkflowResourceReference{Name: "t"}},
 			}}},
 		}

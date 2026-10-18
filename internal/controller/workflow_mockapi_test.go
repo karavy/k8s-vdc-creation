@@ -114,9 +114,9 @@ var _ = Describe("Workflow with two sequential ApiCalls", func() {
 		}
 
 		name := types.NamespacedName{Name: "vdc-network-sequence", Namespace: namespace}
-		workflow := &kmetalv1alpha1.Workflow{
+		createWorkflowFor(&kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: name.Name, Namespace: name.Namespace},
-			Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{
 				{Name: "create-vdc", API: &kmetalv1alpha1.WorkflowAPIStep{
 					TemplateRef: kmetalv1alpha1.WorkflowResourceReference{Name: "seq-create-vdc"},
 					Outputs:     []kmetalv1alpha1.WorkflowOutput{{Name: "vdcId", From: "/id"}},
@@ -126,9 +126,7 @@ var _ = Describe("Workflow with two sequential ApiCalls", func() {
 					Inputs:      []kmetalv1alpha1.WorkflowInput{{Step: "create-vdc", Output: "vdcId", To: "/vdcId"}},
 				}},
 			}},
-		}
-		Expect(k8sClient.Create(ctx, workflow)).To(Succeed())
-		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workflow)).To(Succeed()) })
+		}, "")
 
 		workflowReconciler := &WorkflowReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), TerraformRunnerImage: "runner:test"}
 		apiReconciler := &ApiCallReconciler{Client: k8sClient, Executor: executor, AllowedOrigins: []string{baseURL}}
@@ -151,8 +149,8 @@ var _ = Describe("Workflow with two sequential ApiCalls", func() {
 		By("running the two steps in order, each as its own owned ApiCall created from its template")
 		result := &kmetalv1alpha1.Workflow{}
 		Expect(k8sClient.Get(ctx, name, result)).To(Succeed())
-		Expect(result.Status.CurrentStep).To(Equal(int32(2)))
-		Expect(result.Status.Steps).To(HaveLen(2))
+		Expect(stage(result).CurrentStep).To(Equal(int32(2)))
+		Expect(stage(result).Steps).To(HaveLen(2))
 		responseOf := func(step string) map[string]string {
 			call := &kmetalv1alpha1.ApiCall{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: stepCallName(result, step)}, call)).To(Succeed())

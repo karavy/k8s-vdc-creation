@@ -4,9 +4,10 @@
 resources:
 - bases/kmetal.dinova.one_baseclusters.yaml
 - bases/kmetal.dinova.one_apicalls.yaml
-- bases/kmetal.dinova.one_workflows.yaml
 - bases/kmetal.dinova.one_apicalltemplates.yaml
 - bases/kmetal.dinova.one_terraformtemplates.yaml
+- bases/kmetal.dinova.one_workflowtemplates.yaml
+- bases/kmetal.dinova.one_workflows.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

@@ -3,15 +3,19 @@ package apicall
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	apiengine "github.com/karavy/api-engine/pkg/apiengine"
 	kmetalv1alpha1 "github.com/karavy/k8s-vdc-creation/api/v1alpha1"
 )
 
@@ -22,6 +26,9 @@ type Handler struct {
 	APIReader      client.Reader
 	Executor       *APIExecutor
 	AllowedOrigins []string
+	// OriginsConfigMap names a ConfigMap whose "origins" key adds to AllowedOrigins.
+	// Its zero value means none.
+	OriginsConfigMap types.NamespacedName
 }
 
 const (
@@ -87,12 +94,16 @@ func (r *Handler) reader() client.Reader {
 func (r *Handler) scheduleRequest(ctx context.Context, call *kmetalv1alpha1.ApiCall, key operationKey) (ctrl.Result, error) {
 	request, oauth, err := r.buildRequest(ctx, call)
 	if err != nil {
-		if errors.Is(err, errCredentialsUnavailable) {
+		reason, message := "CredentialsUnavailable", "Waiting for the authentication Secret and key"
+		if errors.Is(err, errOriginsUnavailable) {
+			reason, message = "OriginsUnavailable", "Waiting for the origin allowlist ConfigMap to be readable"
+		}
+		if errors.Is(err, errCredentialsUnavailable) || errors.Is(err, errOriginsUnavailable) {
 			condition := meta.FindStatusCondition(call.Status.Conditions, "Ready")
-			if condition != nil && condition.Reason == "CredentialsUnavailable" && condition.ObservedGeneration == call.Generation {
+			if condition != nil && condition.Reason == reason && condition.ObservedGeneration == call.Generation {
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
-			setAPIConditions(call, apiPhasePending, "CredentialsUnavailable", "Waiting for the authentication Secret and key")
+			setAPIConditions(call, apiPhasePending, reason, message)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, r.Status().Update(ctx, call)
 		}
 		call.Status.Phase = apiPhaseFailed
@@ -100,6 +111,9 @@ func (r *Handler) scheduleRequest(ctx context.Context, call *kmetalv1alpha1.ApiC
 		call.Status.CompletedAt = &completed
 		setAPIConditions(call, apiPhaseFailed, "InvalidRequest", "Invalid method, endpoint, headers or authentication; check the operator origin allowlist")
 		return ctrl.Result{}, r.Status().Update(ctx, call)
+	}
+	if call.Spec.Debug {
+		return r.skipForDebug(ctx, call, request)
 	}
 	timeout := call.Spec.TimeoutSeconds
 	if timeout == 0 {
@@ -120,6 +134,24 @@ func (r *Handler) scheduleRequest(ctx context.Context, call *kmetalv1alpha1.ApiC
 	}
 	r.Executor.activate(key)
 	return ctrl.Result{RequeueAfter: apiPollInterval}, nil
+}
+
+// skipForDebug logs the request that would have been sent and completes the ApiCall
+// without sending it. Header values are never logged, because they carry credentials.
+func (r *Handler) skipForDebug(ctx context.Context, call *kmetalv1alpha1.ApiCall, request apiengine.Request) (ctrl.Result, error) {
+	headers := make([]string, 0, len(request.Headers))
+	for name := range request.Headers {
+		headers = append(headers, name)
+	}
+	slices.Sort(headers)
+	log.FromContext(ctx).Info("Skipped ApiCall request because debug is enabled",
+		"apiCall", client.ObjectKeyFromObject(call).String(), "method", request.Method,
+		"endpoint", request.Endpoint, "headers", headers, "body", string(request.Body))
+	call.Status.Phase = apiPhaseSucceeded
+	completed := metav1.Now()
+	call.Status.CompletedAt = &completed
+	setAPIConditions(call, apiPhaseSucceeded, "DebugSkipped", "Debug is enabled: the request was logged and not sent")
+	return ctrl.Result{}, r.Status().Update(ctx, call)
 }
 
 func (r *Handler) collectResult(ctx context.Context, call *kmetalv1alpha1.ApiCall, key operationKey) (ctrl.Result, error) {

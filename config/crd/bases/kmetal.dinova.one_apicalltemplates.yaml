@@ -191,6 +191,11 @@ spec:
                   JSON object body.
                 maxLength: 65536
                 type: string
+              debug:
+                description: |-
+                  Debug makes the ApiCalls created from this template validate and log their request
+                  without sending it. See ApiCallSpec.Debug.
+                type: boolean
               endpoint:
                 description: Endpoint must also be permitted by the operator's origin
                   allowlist.

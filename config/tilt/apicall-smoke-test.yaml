@@ -15,7 +15,7 @@ spec:
 ---
 # A template is never executed: the Workflow runs an owned ApiCall created from it.
 apiVersion: kmetal.dinova.one/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
   name: tilt-mock-echo-run
   namespace: default
@@ -25,3 +25,14 @@ spec:
       api:
         templateRef:
           name: tilt-mock-echo
+---
+apiVersion: kmetal.dinova.one/v1alpha1
+kind: Workflow
+metadata:
+  name: tilt-mock-echo-run
+  namespace: default
+spec:
+  templates:
+    - name: run
+      templateRef:
+        name: tilt-mock-echo-run

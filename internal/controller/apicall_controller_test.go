@@ -303,8 +303,8 @@ var _ = Describe("ApiCall Controller", func() {
 func ownByWorkflow(ctx context.Context, call *kmetalv1alpha1.ApiCall) {
 	owner := &kmetalv1alpha1.Workflow{
 		ObjectMeta: metav1.ObjectMeta{Name: call.Name + "-owner", Namespace: call.Namespace},
-		Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{{
-			Name: "step", API: &kmetalv1alpha1.WorkflowAPIStep{TemplateRef: kmetalv1alpha1.WorkflowResourceReference{Name: "template"}},
+		Spec: kmetalv1alpha1.WorkflowSpec{Templates: []kmetalv1alpha1.WorkflowTemplateRun{{
+			Name: "step", TemplateRef: kmetalv1alpha1.WorkflowResourceReference{Name: "template"},
 		}}},
 	}
 	Expect(k8sClient.Create(ctx, owner)).To(Succeed())

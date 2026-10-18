@@ -31,6 +31,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -70,7 +71,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
-	var apiAllowedOrigins string
+	var apiAllowedOrigins, apiOriginsConfigMap string
 	var tfStateEndpoint, tfStateBucket, tfStateRegion string
 	var apiCAFile string
 	var apiWorkers, apiQueueSize int
@@ -83,6 +84,10 @@ func main() {
 		"Region of the Terraform state storage (often arbitrary on-premises).")
 	flag.StringVar(&apiAllowedOrigins, "apicall-allowed-origins", "",
 		"Comma-separated HTTP(S) origins allowed for ApiCall; empty denies all destinations.")
+	flag.StringVar(&apiOriginsConfigMap, "apicall-allowed-origins-configmap", "",
+		"Optional namespace/name of a ConfigMap whose \"origins\" key lists more allowed origins, one per line "+
+			"or comma-separated, added to --apicall-allowed-origins. "+
+			"It is read on every request, so edits apply without a restart.")
 	flag.StringVar(&apiCAFile, "apicall-ca-file", "",
 		"Optional PEM CA bundle to trust for ApiCall HTTPS endpoints, in addition to system roots.")
 	flag.IntVar(&apiWorkers, "apicall-workers", 4, "Maximum concurrent ApiCall HTTP requests (1-64).")
@@ -236,15 +241,20 @@ func main() {
 		setupLog.Error(err, "Failed to create ApiCall workers")
 		os.Exit(1)
 	}
-	var allowedOrigins []string
-	for value := range strings.SplitSeq(apiAllowedOrigins, ",") {
-		if value = strings.TrimSpace(value); value != "" {
-			allowedOrigins = append(allowedOrigins, value)
+	var originsConfigMap types.NamespacedName
+	if apiOriginsConfigMap != "" {
+		namespace, name, found := strings.Cut(apiOriginsConfigMap, "/")
+		if !found || namespace == "" || name == "" {
+			setupLog.Error(errors.New("expected namespace/name"),
+				"Invalid --apicall-allowed-origins-configmap", "value", apiOriginsConfigMap)
+			os.Exit(1)
 		}
+		originsConfigMap = types.NamespacedName{Namespace: namespace, Name: name}
 	}
 	if err := (&controller.ApiCallReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
-		Executor: executor, AllowedOrigins: allowedOrigins,
+		Executor: executor, AllowedOrigins: apicall.ParseOrigins(apiAllowedOrigins),
+		AllowedOriginsConfigMap: originsConfigMap,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "apicall")
 		os.Exit(1)

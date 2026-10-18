@@ -21,6 +21,7 @@ import (
 	"errors"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,19 +41,22 @@ type ApiCallReconciler struct {
 	APIReader      client.Reader
 	Executor       *apicall.APIExecutor
 	AllowedOrigins []string
+	// AllowedOriginsConfigMap names a ConfigMap whose "origins" key adds to AllowedOrigins.
+	AllowedOriginsConfigMap types.NamespacedName
 }
 
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=apicalls,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=apicalls/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kmetal.dinova.one,resources=apicalls/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 
 // Reconcile delegates the state machine to the ApiCall helpers. HTTP waits live
 // in the manager-owned executor, never in a reconciliation worker.
 func (r *ApiCallReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	helper := &apicall.Handler{
 		Client: r.Client, APIReader: r.APIReader,
-		Executor: r.Executor, AllowedOrigins: r.AllowedOrigins,
+		Executor: r.Executor, AllowedOrigins: r.AllowedOrigins, OriginsConfigMap: r.AllowedOriginsConfigMap,
 	}
 	return helper.Reconcile(ctx, req)
 }

@@ -43,9 +43,9 @@ func pollScenario(name string, server *httptest.Server, poll kmetalv1alpha1.Work
 	poll.TemplateRef = kmetalv1alpha1.WorkflowResourceReference{Name: name + "-poll"}
 	poll.Inputs = []kmetalv1alpha1.WorkflowInput{{Step: "wait", Output: "operation", To: "/operation"}}
 	poll.IntervalSeconds, poll.ConditionJSONPointer, poll.EqualsJSON = 1, "/ready", "true"
-	return runWorkflow(&kmetalv1alpha1.Workflow{
+	return runWorkflow(&kmetalv1alpha1.WorkflowTemplate{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{{
+		Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{{
 			Name: "wait", API: apiStepOf(name+"-start", func(step *kmetalv1alpha1.WorkflowAPIStep) {
 				step.Outputs = []kmetalv1alpha1.WorkflowOutput{{Name: "operation", From: "/operationId"}}
 				step.Poll = &poll

@@ -27,7 +27,7 @@ spec:
   timeoutSeconds: 30
 ---
 apiVersion: kmetal.dinova.one/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
   name: tilt-vdc-network
   namespace: default
@@ -50,3 +50,14 @@ spec:
           - step: create-vdc
             output: vdcId
             to: /vdcId
+---
+apiVersion: kmetal.dinova.one/v1alpha1
+kind: Workflow
+metadata:
+  name: tilt-vdc-network
+  namespace: default
+spec:
+  templates:
+    - name: run
+      templateRef:
+        name: tilt-vdc-network

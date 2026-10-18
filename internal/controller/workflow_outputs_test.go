@@ -68,13 +68,43 @@ func createTemplates(templates map[string]kmetalv1alpha1.ApiCallTemplateSpec) {
 	}
 }
 
-// runWorkflow creates workflow and drives the Workflow and ApiCall reconcilers, like
-// a running manager would, until it reaches a final phase. It returns that state.
-func runWorkflow(workflow *kmetalv1alpha1.Workflow, origin string, executor *apicall.APIExecutor) *kmetalv1alpha1.Workflow {
+// testStage names the only use of a template in the Workflows the tests create.
+const testStage = "main"
+
+// createWorkflowFor creates template, and a Workflow of the same name that runs it as its
+// only template, with the given parameter values. Both go away with the current spec.
+func createWorkflowFor(template *kmetalv1alpha1.WorkflowTemplate, workspaceStorage string, values ...kmetalv1alpha1.WorkflowParameter) *kmetalv1alpha1.Workflow {
 	GinkgoHelper()
-	workflow.Namespace = "default"
+	template.Namespace = "default"
+	Expect(k8sClient.Create(ctx, template)).To(Succeed())
+	DeferCleanup(func() { Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, template))).To(Succeed()) })
+	workflow := &kmetalv1alpha1.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: template.Name, Namespace: "default"},
+		Spec: kmetalv1alpha1.WorkflowSpec{
+			WorkspaceStorage: workspaceStorage,
+			Templates: []kmetalv1alpha1.WorkflowTemplateRun{{
+				Name: testStage, TemplateRef: kmetalv1alpha1.WorkflowResourceReference{Name: template.Name}, Parameters: values,
+			}},
+		},
+	}
 	Expect(k8sClient.Create(ctx, workflow)).To(Succeed())
-	DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workflow)).To(Succeed()) })
+	DeferCleanup(func() { Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, workflow))).To(Succeed()) })
+	return workflow
+}
+
+// stage returns the status of the only template the Workflow runs.
+func stage(workflow *kmetalv1alpha1.Workflow) kmetalv1alpha1.WorkflowTemplateStatus {
+	GinkgoHelper()
+	Expect(workflow.Status.Templates).To(HaveLen(1))
+	return workflow.Status.Templates[0]
+}
+
+// runWorkflow creates template and a Workflow that runs it, and drives the Workflow and
+// ApiCall reconcilers, like a running manager would, until it reaches a final phase. It
+// returns that state.
+func runWorkflow(template *kmetalv1alpha1.WorkflowTemplate, origin string, executor *apicall.APIExecutor, values ...kmetalv1alpha1.WorkflowParameter) *kmetalv1alpha1.Workflow {
+	GinkgoHelper()
+	workflow := createWorkflowFor(template, "", values...)
 	key := client.ObjectKeyFromObject(workflow)
 	workflowReconciler := &WorkflowReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), TerraformRunnerImage: "runner:test"}
 	apiReconciler := &ApiCallReconciler{Client: k8sClient, Executor: executor, AllowedOrigins: []string{origin}}
@@ -96,7 +126,7 @@ func runWorkflow(workflow *kmetalv1alpha1.Workflow, origin string, executor *api
 
 func stepStatus(workflow *kmetalv1alpha1.Workflow, name string) kmetalv1alpha1.WorkflowStepStatus {
 	GinkgoHelper()
-	for _, step := range workflow.Status.Steps {
+	for _, step := range stage(workflow).Steps {
 		if step.Name == name {
 			return step
 		}
@@ -155,9 +185,9 @@ var _ = Describe("Workflow step outputs and inputs", func() {
 			"out-noop":  {Method: http.MethodPost, Endpoint: server.URL + "/noop"},
 			"out-use":   {Method: http.MethodPost, Endpoint: server.URL + "/use", Body: `{"static":"kept"}`},
 		})
-		workflow := runWorkflow(&kmetalv1alpha1.Workflow{
+		workflow := runWorkflow(&kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "outputs-sensitive"},
-			Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{
 				{Name: "login", API: apiStepOf("out-login", func(s *kmetalv1alpha1.WorkflowAPIStep) {
 					s.Outputs = []kmetalv1alpha1.WorkflowOutput{
 						{Name: "token", From: "/token", Sensitive: true},
@@ -187,9 +217,9 @@ var _ = Describe("Workflow step outputs and inputs", func() {
 		Expect(string(statusJSON)).NotTo(ContainSubstring("s3cr3t-token"))
 
 		By("storing it in a Secret owned by the Workflow")
-		Expect(workflow.Status.OutputsSecretName).NotTo(BeEmpty())
+		Expect(stage(workflow).OutputsSecretName).NotTo(BeEmpty())
 		secret := &corev1.Secret{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: workflow.Status.OutputsSecretName}, secret)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: stage(workflow).OutputsSecretName}, secret)).To(Succeed())
 		Expect(secret.Data).To(HaveKeyWithValue("login.token", []byte(`"s3cr3t-token"`)))
 		Expect(secret.OwnerReferences).To(ContainElement(HaveField("Name", "outputs-sensitive")))
 	})
@@ -199,9 +229,9 @@ var _ = Describe("Workflow step outputs and inputs", func() {
 			"def-first":  {Method: http.MethodPost, Endpoint: server.URL + "/first"},
 			"def-second": {Method: http.MethodPost, Endpoint: server.URL + "/second"},
 		})
-		workflow := runWorkflow(&kmetalv1alpha1.Workflow{
+		workflow := runWorkflow(&kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "outputs-default"},
-			Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{
 				{Name: "first", API: apiStepOf("def-first", func(s *kmetalv1alpha1.WorkflowAPIStep) {
 					s.Outputs = []kmetalv1alpha1.WorkflowOutput{{Name: "region", From: "/region", DefaultJSON: `"eu-1"`}}
 				})},
@@ -213,9 +243,9 @@ var _ = Describe("Workflow step outputs and inputs", func() {
 		Expect(workflow.Status.Phase).To(Equal("Succeeded"))
 		Expect(bodyReceived("/second")).To(Equal(map[string]any{"region": "eu-1"}))
 
-		missing := runWorkflow(&kmetalv1alpha1.Workflow{
+		missing := runWorkflow(&kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "outputs-missing"},
-			Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{
 				{Name: "first", API: apiStepOf("def-first", func(s *kmetalv1alpha1.WorkflowAPIStep) {
 					s.Outputs = []kmetalv1alpha1.WorkflowOutput{{Name: "region", From: "/region"}}
 				})},
@@ -224,7 +254,7 @@ var _ = Describe("Workflow step outputs and inputs", func() {
 		}, server.URL, startExecutor())
 		Expect(missing.Status.Phase).To(Equal("Failed"))
 		Expect(readyReason(missing)).To(Equal("OutputMissing"))
-		Expect(missing.Status.CurrentStep).To(Equal(int32(0)), "the workflow must stop before the next step")
+		Expect(stage(missing).CurrentStep).To(Equal(int32(0)), "the workflow must stop before the next step")
 	})
 
 	It("rejects a reference to an unknown output before running any step", func() {
@@ -232,9 +262,9 @@ var _ = Describe("Workflow step outputs and inputs", func() {
 			"ref-first":  {Method: http.MethodPost, Endpoint: server.URL + "/first"},
 			"ref-second": {Method: http.MethodPost, Endpoint: server.URL + "/second"},
 		})
-		workflow := runWorkflow(&kmetalv1alpha1.Workflow{
+		workflow := runWorkflow(&kmetalv1alpha1.WorkflowTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "outputs-bad-reference"},
-			Spec: kmetalv1alpha1.WorkflowSpec{Steps: []kmetalv1alpha1.WorkflowStep{
+			Spec: kmetalv1alpha1.WorkflowTemplateSpec{Steps: []kmetalv1alpha1.WorkflowStep{
 				{Name: "first", API: apiStepOf("ref-first", nil)},
 				{Name: "second", API: apiStepOf("ref-second", func(s *kmetalv1alpha1.WorkflowAPIStep) {
 					s.Inputs = []kmetalv1alpha1.WorkflowInput{{Step: "first", Output: "typo", To: "/x"}}
@@ -242,7 +272,7 @@ var _ = Describe("Workflow step outputs and inputs", func() {
 			}},
 		}, server.URL, startExecutor())
 		Expect(workflow.Status.Phase).To(Equal("Failed"))
-		Expect(readyReason(workflow)).To(Equal("InvalidReference"))
+		Expect(readyReason(workflow)).To(Equal("InvalidTemplate"))
 		mu.Lock()
 		defer mu.Unlock()
 		Expect(received).To(BeEmpty(), "no request may be sent for an invalid workflow")

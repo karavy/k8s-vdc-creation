@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - ../default
   - ../debug-api
+  - operator-config.yaml
   - apicall-smoke-test.yaml
   - workflow-sequence.yaml
   - tfstate-storage.yaml
@@ -24,6 +25,7 @@ patches:
           - --leader-elect
           - --health-probe-bind-address=:8081
           - --apicall-allowed-origins=http://mock-api.apicall-debug.svc.cluster.local:8080
+          - --apicall-allowed-origins-configmap=k8s-vdc-creation-system/operator-config
           - --tfstate-s3-endpoint=http://minio.tfstate-storage.svc.cluster.local:9000
           - --tfstate-s3-bucket=tfstate
           - --tfstate-s3-region=us-east-1

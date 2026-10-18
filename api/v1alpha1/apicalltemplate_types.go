@@ -43,6 +43,10 @@ type ApiCallTemplateSpec struct {
 	// ApiCall, a template stays editable; Workflows read it when a step starts.
 	// +optional
 	Authentication *APIAuthentication `json:"authentication,omitempty"`
+	// Debug makes the ApiCalls created from this template validate and log their request
+	// without sending it. See ApiCallSpec.Debug.
+	// +optional
+	Debug bool `json:"debug,omitempty"`
 	// TimeoutSeconds bounds the whole request, including response body reading.
 	// +kubebuilder:default=120
 	// +kubebuilder:validation:Minimum=1

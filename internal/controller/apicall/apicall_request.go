@@ -35,6 +35,7 @@ import (
 
 var errInvalidRequest = errors.New("invalid API request configuration")
 var errCredentialsUnavailable = errors.New("authentication Secret or key is unavailable")
+var errOriginsUnavailable = errors.New("origin allowlist ConfigMap could not be read")
 
 const (
 	apiAuthBearer          = "Bearer"
@@ -95,8 +96,14 @@ func (r *Handler) buildRequest(ctx context.Context, call *kmetalv1alpha1.ApiCall
 		return request, nil, errInvalidRequest
 	}
 	endpointOrigin, err := origin(request.Endpoint)
-	if err != nil || !r.originAllowed(endpointOrigin) || len(call.Spec.Body) > 65536 || len(call.Spec.Headers) > 32 {
+	if err != nil || len(call.Spec.Body) > 65536 || len(call.Spec.Headers) > 32 {
 		return request, nil, errInvalidRequest
+	}
+	if allowed, err := r.originAllowed(ctx, endpointOrigin); err != nil || !allowed {
+		if err == nil {
+			err = errInvalidRequest
+		}
+		return request, nil, err
 	}
 	for key, value := range call.Spec.Headers {
 		if !validHeaderName(key) || len(key) > 128 || len(value) > 4096 || strings.ContainsAny(value, "\r\n") || sensitiveHeader(key) {
@@ -131,8 +138,14 @@ func (r *Handler) buildRequest(ctx context.Context, call *kmetalv1alpha1.ApiCall
 func (r *Handler) oauth2Credentials(ctx context.Context, call *kmetalv1alpha1.ApiCall) (*oauth2Credentials, error) {
 	auth := call.Spec.Authentication
 	tokenOrigin, err := origin(auth.TokenURL)
-	if err != nil || !strings.HasPrefix(tokenOrigin, "https://") || !r.originAllowed(tokenOrigin) {
+	if err != nil || !strings.HasPrefix(tokenOrigin, "https://") {
 		return nil, errInvalidRequest
+	}
+	if allowed, err := r.originAllowed(ctx, tokenOrigin); err != nil || !allowed {
+		if err == nil {
+			err = errInvalidRequest
+		}
+		return nil, err
 	}
 	method := auth.ClientAuthenticationMethod
 	if method == "" {
@@ -209,14 +222,18 @@ func requestOAuth2Token(ctx context.Context, client *apiengine.Client, credentia
 	return token.AccessToken, nil
 }
 
-func (r *Handler) originAllowed(endpointOrigin string) bool {
-	for _, allowed := range r.AllowedOrigins {
+func (r *Handler) originAllowed(ctx context.Context, endpointOrigin string) (bool, error) {
+	origins, err := r.allowedOrigins(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, allowed := range origins {
 		allowedOrigin, err := origin(allowed)
 		if err == nil && allowedOrigin == endpointOrigin {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func validHeaderName(key string) bool {

@@ -6,43 +6,12 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: workflow-sample
 spec:
-  # Steps reference existing ApiCallTemplate resources (see
-  # kmetal_v1alpha1_apicalltemplate.yaml). A template is never executed: the Workflow
-  # creates an owned ApiCall from it, and the ApiCall controller only runs ApiCalls
-  # that a Workflow owns.
-  steps:
-    - name: create-resource
-      api:
-        templateRef:
-          name: apicalltemplate-sample
-    # A step can publish named values from its response (outputs), and any later step can
-    # set them into its request body (inputs). Sensitive outputs go to a per-workflow
-    # Secret instead of the Workflow status.
-    #
-    # - name: login
-    #   api:
-    #     templateRef: {name: apicalltemplate-login}
-    #     outputs:
-    #       - {name: token, from: /token, sensitive: true}
-    #       - {name: region, from: /region, defaultJSON: '"eu-1"'}
-    # - name: create-resource
-    #   api:
-    #     templateRef: {name: apicalltemplate-sample}
-    #     inputs:
-    #       - {step: login, output: token, to: /auth/token}
-    #
-    # A Terraform step runs a TerraformTemplate (see kmetal_v1alpha1_terraformtemplate.yaml);
-    # its inputs become the Terraform variables ("to" names the variable).
-    #
-    # - name: provision
-    #   terraform:
-    #     templateRef: {name: terraformtemplate-sample}
-    #     # Workflows that use the same key in the same namespace share one Terraform state, so a
-    #     # later run with changed inputs modifies the resources instead of creating them again.
-    #     state:
-    #       key: vdc/{{steps.create-resource.outputs.vdcId}}/network
-    #     envFromSecrets: [tfstate-credentials]   # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-    #     inputs:
-    #       - {step: create-resource, output: vdcId, to: /vdc_id}
-    #     outputs:
-    #       - {name: networkId, from: /network_id}
+  # Templates run in order, and the first one that fails stops the Workflow. A template can be
+  # used twice, under two names. Parameters give a value to the ones the template declares.
+  templates:
+    - name: create
+      templateRef:
+        name: workflowtemplate-sample
+      parameters:
+        - {name: clientName, value: acme}
+        - {name: region, value: eu-2}

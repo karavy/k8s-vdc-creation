@@ -65,6 +65,7 @@ spec:
           - --health-probe-bind-address=:8081
           # ApiCall denies destinations by default. Enable only trusted API origins.
           # - --apicall-allowed-origins=https://api.example.com
+          - --apicall-allowed-origins-configmap=default/operator-config
           # - --apicall-workers=4
           # - --apicall-queue-size=64
         image: controller:latest

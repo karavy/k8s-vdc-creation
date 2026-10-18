@@ -29,6 +29,57 @@ rende disponibile il client, ma non esegue chiamate automaticamente e non
 aggiunge campi alla CRD. Il mapping delle operazioni sulle risorse esterne resta
 da definire.
 
+## WorkflowTemplate e Workflow
+
+Due CRD, come per ApiCallTemplate e ApiCall:
+
+- [WorkflowTemplate](api/v1alpha1/workflowtemplate_types.go) è la **definizione** riusabile:
+  `parameters` (con un eventuale `default`), `steps` e `deleteSteps`. Non ha status né controller
+  e non viene mai eseguito da solo.
+- [Workflow](api/v1alpha1/workflow_types.go) **lancia** uno o più template, **in sequenza**, e
+  dà un valore ai loro parametri. È immutabile: è la registrazione di una esecuzione.
+
+```yaml
+kind: Workflow
+spec:
+  templates:
+    - name: free-subnet            # nome di questo uso, unico nel Workflow
+      templateRef: {name: p2p-free-subnet}
+      parameters:
+        - {name: clientName, value: EXMACHINA}
+```
+
+Esempi in [config/samples/p2p-workflow/](config/samples/p2p-workflow/) e in
+[config/samples/kmetal_v1alpha1_workflowtemplate.yaml](config/samples/kmetal_v1alpha1_workflowtemplate.yaml).
+
+**Esecuzione.** Un template parte quando il precedente è finito, e il primo che fallisce ferma
+il Workflow (`status.phase: Failed`, con il motivo nella condizione `Ready`). Lo stesso template
+si può usare più volte con nomi diversi. Lo stato di ogni template è in `status.templates`.
+
+**Parametri.** Il Workflow dà un valore ai parametri che il template dichiara; uno che il
+template non dichiara è rifiutato, e lo è anche uno mancante senza `default` (`InvalidTemplate`),
+così un errore di battitura non parte con il valore sbagliato. Gli step usano un parametro con un
+input `parameter: <nome>`, con `equalsParameter` in un `select`, o con `{{parameters.<nome>}}` in
+un output `template`.
+
+**Template modificato.** Un template resta modificabile, ma un Workflow che lo sta eseguendo
+fallisce con `TemplateChanged` se cambia: meglio fermarsi che mescolare due versioni.
+
+**Eliminazione.** I `deleteSteps` dei template girano quando il Workflow viene **eliminato** da
+Kubernetes, **dall'ultimo template al primo** e solo per quelli partiti (anche quello fallito,
+che potrebbe aver lasciato qualcosa). Sono ammessi solo step `api`. Il Workflow resta fino alla
+fine grazie al finalizer `kmetal.dinova.one/workflow-deletion`, che l'operator aggiunge solo se
+un template ha `deleteSteps`. Uno step che ha bisogno dell'output di uno step che non è mai
+arrivato in fondo viene **saltato** (`Skipped`): non c'è niente da annullare. Se uno step di
+eliminazione **fallisce**, il Workflow non sparisce: resta con `status.deletion.phase: Failed`,
+così la pulizia non va persa in silenzio; per rinunciarci si toglie il finalizer a mano.
+Anche un template che non esiste più blocca la pulizia con `WorkflowTemplateNotFound`.
+
+**Nomi degli oggetti creati.** Gli ApiCall, i Secret, i Job e i PVC di un template hanno il nome
+del suo uso nel nome e le etichette `kmetal.dinova.one/workflow` e
+`kmetal.dinova.one/workflow-template`, quindi due template con step omonimi non si confondono.
+Gli output degli step sono visibili solo dentro il proprio template.
+
 ## ApiCall
 
 I file Kubebuilder [internal/controller/apicall_controller.go](internal/controller/apicall_controller.go)
@@ -44,14 +95,14 @@ di una chiamata HTTP tramite `api-engine`. Il manifest completo è in
 **Un ApiCall creato da solo non viene mai eseguito.** La definizione riusabile di
 una chiamata è un [ApiCallTemplate](api/v1alpha1/apicalltemplate_types.go) (metodo,
 endpoint, body, header, autenticazione, timeout), che non ha status né controller
-e non viene mai eseguito. Un [Workflow](api/v1alpha1/workflow_types.go) lo richiama
-per nome con `templateRef`: per ogni step crea un ApiCall figlio, di cui è owner, ed
+e non viene mai eseguito. Un [Workflow](api/v1alpha1/workflow_types.go) lo richiama,
+attraverso uno step di un WorkflowTemplate, per nome con `templateRef`: per ogni step crea un ApiCall figlio, di cui è owner, ed
 è solo questo che il controller esegue. Lo stesso template può quindi essere riusato
 da più workflow e più step. Poll e passaggio dei dati (`inputs`/`outputs`) si
-definiscono nello step del Workflow; anche il poll richiama un template per nome.
+definiscono nello step del WorkflowTemplate; anche il poll richiama un template per nome.
 Esempi in
 [config/samples/kmetal_v1alpha1_apicalltemplate.yaml](config/samples/kmetal_v1alpha1_apicalltemplate.yaml)
-e [config/samples/kmetal_v1alpha1_workflow.yaml](config/samples/kmetal_v1alpha1_workflow.yaml).
+e [config/samples/kmetal_v1alpha1_workflowtemplate.yaml](config/samples/kmetal_v1alpha1_workflowtemplate.yaml).
 
 Per le API asincrone lo step ha un `poll`: dopo la chiamata iniziale ripete a
 `intervalSeconds` (default 5) la chiamata del template `poll.templateRef`, fino a
@@ -220,15 +271,37 @@ Il manager espone questi flag:
 | Flag | Default | Descrizione |
 | --- | --- | --- |
 | `--apicall-allowed-origins` | vuoto | Origini esatte separate da virgole, ad esempio `https://api.example.com,https://other.example.com:8443`. Vuoto **nega tutte le chiamate**. |
+| `--apicall-allowed-origins-configmap` | vuoto | `namespace/nome` di un ConfigMap la cui chiave `origins` elenca altre origini, una per riga o separate da virgole (le righe che iniziano con `#` sono commenti). Si somma a `--apicall-allowed-origins`. Viene letto a ogni richiesta, quindi una modifica vale subito, senza riavviare l'operator. Un ConfigMap assente non aggiunge origini; una voce che non è un'origine esatta, ad esempio con un path, viene ignorata e scritta nel log. |
 | `--apicall-workers` | 4 | Massimo numero di richieste HTTP concorrenti, 1–64. |
 | `--apicall-queue-size` | 64 | Capacità aggiuntiva del pool, 1–4096. I risultati completati ma non ancora persistiti occupano capacità. |
 
 Per il manifest OAuth2 di esempio, configurare
 `--apicall-allowed-origins=https://api.example.com,https://auth.example.com`
 negli argomenti del manager in [config/manager/manager.yaml](config/manager/manager.yaml)
+(oppure elencarle in un ConfigMap, vedi sotto)
 e creare il Secret `oauth-client-credentials` con le chiavi `client-id` e
 `client-secret` nella namespace della CR. Nessun Secret con credenziali reali
 viene incluso nei manifest di esempio.
+
+Con più server API conviene tenere le origini in un ConfigMap nella namespace
+dell'operator, non in quelle dei tenant: chi può modificarlo decide dove l'operator
+può chiamare.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: k8s-vdc-creation-system
+  name: apicall-allowed-origins
+data:
+  origins: |
+    # portale
+    https://dev-portal.admin.dinova.cloud:8453
+    https://auth.example.com
+```
+
+con `--apicall-allowed-origins-configmap=k8s-vdc-creation-system/apicall-allowed-origins`
+negli argomenti del manager.
 
 ### Esecuzione e stato
 
@@ -372,7 +445,7 @@ Usare `make mock-api-test` per i test, `make mock-api-run` per ascoltare su
 		 body: '{"message":"test da ApiCall"}'
 	 ---
 	 apiVersion: kmetal.dinova.one/v1alpha1
-	 kind: Workflow
+	 kind: WorkflowTemplate
 	 metadata:
 		 name: mock-echo-run
 	 spec:
@@ -381,6 +454,16 @@ Usare `make mock-api-test` per i test, `make mock-api-run` per ascoltare su
 				 api:
 					 templateRef:
 						 name: mock-echo
+	 ---
+	 apiVersion: kmetal.dinova.one/v1alpha1
+	 kind: Workflow
+	 metadata:
+		 name: mock-echo-run
+	 spec:
+		 templates:
+			 - name: run
+				 templateRef:
+					 name: mock-echo-run
 	 ```
 
 	 Aggiungere `--apicall-allowed-origins=http://mock-api.apicall-debug.svc.cluster.local:8080`

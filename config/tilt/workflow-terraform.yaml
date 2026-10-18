@@ -29,7 +29,7 @@ spec:
         }
 ---
 apiVersion: kmetal.dinova.one/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
   name: tilt-api-then-terraform
   namespace: default
@@ -56,3 +56,14 @@ spec:
         outputs:
           - {name: record, from: /record}
           - {name: token, from: /admin_token}
+---
+apiVersion: kmetal.dinova.one/v1alpha1
+kind: Workflow
+metadata:
+  name: tilt-api-then-terraform
+  namespace: default
+spec:
+  templates:
+    - name: run
+      templateRef:
+        name: tilt-api-then-terraform
